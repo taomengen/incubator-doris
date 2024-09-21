@@ -17,15 +17,31 @@
 
 #include "vec/exprs/vin_predicate.h"
 
-#include <string_view>
+#include <fmt/format.h>
+#include <gen_cpp/Exprs_types.h>
+#include <glog/logging.h>
+#include <stddef.h>
+
+#include <algorithm>
+#include <memory>
+#include <ostream>
+#include <vector>
 
 #include "common/status.h"
-#include "exprs/create_predicate_function.h"
-#include "vec/columns/column_set.h"
-#include "vec/core/field.h"
-#include "vec/data_types/data_type_factory.hpp"
-#include "vec/data_types/data_type_nullable.h"
+#include "runtime/runtime_state.h"
+#include "vec/core/block.h"
+#include "vec/core/column_numbers.h"
+#include "vec/core/column_with_type_and_name.h"
+#include "vec/core/columns_with_type_and_name.h"
+#include "vec/exprs/vexpr_context.h"
+#include "vec/exprs/vliteral.h"
+#include "vec/exprs/vslot_ref.h"
 #include "vec/functions/simple_function_factory.h"
+
+namespace doris {
+class RowDescriptor;
+class RuntimeState;
+} // namespace doris
 
 namespace doris::vectorized {
 
@@ -53,6 +69,10 @@ Status VInPredicate::prepare(RuntimeState* state, const RowDescriptor& desc,
     // construct the proper function_name
     std::string head(_is_not_in ? "not_" : "");
     std::string real_function_name = head + std::string(function_name);
+    auto arg_type = remove_nullable(argument_template[0].type);
+    if (is_struct(arg_type) || is_array(arg_type) || is_map(arg_type)) {
+        real_function_name = "collection_" + real_function_name;
+    }
     _function = SimpleFunctionFactory::instance().get_function(real_function_name,
                                                                argument_template, _data_type);
     if (_function == nullptr) {
@@ -60,26 +80,66 @@ Status VInPredicate::prepare(RuntimeState* state, const RowDescriptor& desc,
     }
 
     VExpr::register_function_context(state, context);
+    _prepare_finished = true;
+
+    if (state->query_options().__isset.in_list_value_count_threshold) {
+        _in_list_value_count_threshold = state->query_options().in_list_value_count_threshold;
+    }
+
+    const auto in_list_value_count = _children.size() - 1;
+    // When the number of values in the IN condition exceeds this threshold, fast_execute will not be used
+    _can_fast_execute = in_list_value_count <= _in_list_value_count_threshold;
     return Status::OK();
 }
 
 Status VInPredicate::open(RuntimeState* state, VExprContext* context,
                           FunctionContext::FunctionStateScope scope) {
-    RETURN_IF_ERROR(VExpr::open(state, context, scope));
+    DCHECK(_prepare_finished);
+    for (auto& child : _children) {
+        RETURN_IF_ERROR(child->open(state, context, scope));
+    }
     RETURN_IF_ERROR(VExpr::init_function_context(context, scope, _function));
+    if (scope == FunctionContext::FRAGMENT_LOCAL) {
+        RETURN_IF_ERROR(VExpr::get_const_col(context, nullptr));
+    }
+
+    _is_args_all_constant = std::all_of(_children.begin() + 1, _children.end(),
+                                        [](const VExprSPtr& expr) { return expr->is_constant(); });
+    _open_finished = true;
     return Status::OK();
 }
 
-void VInPredicate::close(RuntimeState* state, VExprContext* context,
-                         FunctionContext::FunctionStateScope scope) {
+size_t VInPredicate::skip_constant_args_size() const {
+    if (_is_args_all_constant && !_can_fast_execute) {
+        // This is an optimization. For expressions like colA IN (1, 2, 3, 4),
+        // where all values inside the IN clause are constants,
+        // a hash set is created during open, and it will not be accessed again during execute
+        //  Here, _children[0] is colA
+        return 1;
+    }
+    return _children.size();
+}
+
+void VInPredicate::close(VExprContext* context, FunctionContext::FunctionStateScope scope) {
     VExpr::close_function_context(context, scope, _function);
-    VExpr::close(state, context, scope);
+    VExpr::close(context, scope);
+}
+
+Status VInPredicate::evaluate_inverted_index(VExprContext* context, uint32_t segment_num_rows) {
+    DCHECK_GE(get_num_children(), 2);
+    return _evaluate_inverted_index(context, _function, segment_num_rows);
 }
 
 Status VInPredicate::execute(VExprContext* context, Block* block, int* result_column_id) {
-    // TODO: not execute const expr again, but use the const column in function context
-    doris::vectorized::ColumnNumbers arguments(_children.size());
-    for (int i = 0; i < _children.size(); ++i) {
+    if (is_const_and_have_executed()) { // const have execute in open function
+        return get_result_from_const(block, _expr_name, result_column_id);
+    }
+    if (_can_fast_execute && fast_execute(context, block, result_column_id)) {
+        return Status::OK();
+    }
+    DCHECK(_open_finished || _getting_const_col);
+    doris::vectorized::ColumnNumbers arguments(skip_constant_args_size());
+    for (int i = 0; i < skip_constant_args_size(); ++i) {
         int column_id = -1;
         RETURN_IF_ERROR(_children[i]->execute(context, block, &column_id));
         arguments[i] = column_id;
@@ -88,6 +148,7 @@ Status VInPredicate::execute(VExprContext* context, Block* block, int* result_co
     size_t num_columns_without_result = block->columns();
     // prepare a column to save result
     block->insert({nullptr, _data_type, _expr_name});
+
     RETURN_IF_ERROR(_function->execute(context->fn_context(_fn_context_index), *block, arguments,
                                        num_columns_without_result, block->rows(), false));
     *result_column_id = num_columns_without_result;

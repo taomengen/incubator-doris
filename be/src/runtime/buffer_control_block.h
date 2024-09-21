@@ -17,21 +17,30 @@
 
 #pragma once
 
+#include <gen_cpp/PaloInternalService_types.h>
+#include <gen_cpp/Types_types.h>
+#include <stdint.h>
+
 #include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <list>
+#include <memory>
 #include <mutex>
+#include <unordered_map>
 
 #include "common/status.h"
-#include "gen_cpp/Types_types.h"
 #include "runtime/query_statistics.h"
+#include "runtime/runtime_state.h"
+#include "util/hash_util.hpp"
 
-namespace google {
-namespace protobuf {
+namespace google::protobuf {
 class Closure;
-}
-} // namespace google
+} // namespace google::protobuf
+
+namespace arrow {
+class RecordBatch;
+} // namespace arrow
 
 namespace brpc {
 class Controller;
@@ -39,7 +48,10 @@ class Controller;
 
 namespace doris {
 
-class TFetchDataResult;
+namespace pipeline {
+class Dependency;
+} // namespace pipeline
+
 class PFetchDataResult;
 
 struct GetResultBatchCtx {
@@ -60,91 +72,71 @@ struct GetResultBatchCtx {
 // buffer used for result customer and producer
 class BufferControlBlock {
 public:
-    BufferControlBlock(const TUniqueId& id, int buffer_size);
-    virtual ~BufferControlBlock();
+    BufferControlBlock(const TUniqueId& id, int buffer_size, int batch_size);
+    ~BufferControlBlock();
 
     Status init();
-    virtual bool can_sink(); // 只有一个fragment写入，因此can_sink返回true，则一定可以执行sink
-    Status add_batch(std::unique_ptr<TFetchDataResult>& result);
+    Status add_batch(RuntimeState* state, std::unique_ptr<TFetchDataResult>& result);
+    Status add_arrow_batch(RuntimeState* state, std::shared_ptr<arrow::RecordBatch>& result);
 
     void get_batch(GetResultBatchCtx* ctx);
+    Status get_arrow_batch(std::shared_ptr<arrow::RecordBatch>* result);
 
     // close buffer block, set _status to exec_status and set _is_close to true;
     // called because data has been read or error happened.
-    Status close(Status exec_status);
+    Status close(const TUniqueId& id, Status exec_status);
     // this is called by RPC, called from coordinator
-    Status cancel();
+    void cancel();
 
-    const TUniqueId& fragment_id() const { return _fragment_id; }
+    [[nodiscard]] const TUniqueId& fragment_id() const { return _fragment_id; }
 
-    void set_query_statistics(std::shared_ptr<QueryStatistics> statistics) {
-        _query_statistics = statistics;
-    }
-
-    void update_num_written_rows(int64_t num_rows) {
+    void update_return_rows(int64_t num_rows) {
         // _query_statistics may be null when the result sink init failed
         // or some other failure.
         // and the number of written rows is only needed when all things go well.
         if (_query_statistics != nullptr) {
-            _query_statistics->set_returned_rows(num_rows);
+            _query_statistics->add_returned_rows(num_rows);
         }
     }
 
-    // TODO: The value of query peak mem usage in fe.audit.log comes from a random BE,
-    // not the BE with the largest peak mem usage
-    void update_max_peak_memory_bytes() {
-        if (_query_statistics != nullptr) {
-            int64_t max_peak_memory_bytes = _query_statistics->calculate_max_peak_memory_bytes();
-            _query_statistics->set_max_peak_memory_bytes(max_peak_memory_bytes);
-        }
-    }
+    void set_dependency(const TUniqueId& id,
+                        std::shared_ptr<pipeline::Dependency> result_sink_dependency);
 
 protected:
-    virtual bool _get_batch_queue_empty() { return _batch_queue.empty(); }
-    virtual void _update_batch_queue_empty() {}
+    void _update_dependency();
 
-    using ResultQueue = std::list<std::unique_ptr<TFetchDataResult>>;
+    using FeResultQueue = std::list<std::unique_ptr<TFetchDataResult>>;
+    using ArrowFlightResultQueue = std::list<std::shared_ptr<arrow::RecordBatch>>;
 
     // result's query id
     TUniqueId _fragment_id;
     bool _is_close;
     std::atomic_bool _is_cancelled;
     Status _status;
-    std::atomic_int _buffer_rows;
     const int _buffer_limit;
     int64_t _packet_num;
 
     // blocking queue for batch
-    ResultQueue _batch_queue;
+    FeResultQueue _fe_result_batch_queue;
+    ArrowFlightResultQueue _arrow_flight_batch_queue;
+
     // protects all subsequent data in this block
     std::mutex _lock;
-    // signal arrival of new batch or the eos/cancelled condition
-    std::condition_variable _data_arrival;
-    // signal removal of data by stream consumer
-    std::condition_variable _data_removal;
+
+    // get arrow flight result is a sync method, need wait for data ready and return result.
+    // TODO, waiting for data will block pipeline, so use a request pool to save requests waiting for data.
+    std::condition_variable _arrow_data_arrival;
 
     std::deque<GetResultBatchCtx*> _waiting_rpc;
 
-    // It is shared with PlanFragmentExecutor and will be called in two different
-    // threads. But their calls are all at different time, there is no problem of
-    // multithreading access.
-    std::shared_ptr<QueryStatistics> _query_statistics;
-};
+    // only used for FE using return rows to check limit
+    std::unique_ptr<QueryStatistics> _query_statistics;
+    // instance id to dependency
+    std::unordered_map<TUniqueId, std::shared_ptr<pipeline::Dependency>> _result_sink_dependencys;
+    std::unordered_map<TUniqueId, size_t> _instance_rows;
+    std::list<std::unordered_map<TUniqueId, size_t>> _instance_rows_in_queue;
 
-class PipBufferControlBlock : public BufferControlBlock {
-public:
-    PipBufferControlBlock(const TUniqueId& id, int buffer_size)
-            : BufferControlBlock(id, buffer_size) {}
-
-    bool can_sink() override {
-        return _get_batch_queue_empty() || _buffer_rows < _buffer_limit || _is_cancelled;
-    }
-
-private:
-    bool _get_batch_queue_empty() override { return _batch_queue_empty; }
-    void _update_batch_queue_empty() override { _batch_queue_empty = _batch_queue.empty(); }
-
-    std::atomic_bool _batch_queue_empty = false;
+    int _batch_size;
 };
 
 } // namespace doris

@@ -32,4 +32,31 @@ suite("lateral_view_with_inline_view") {
     example1 lateral view explode([1,2,3]) tmp1 as e1 where col4<e1;
     """
 
+    qt_sql """
+    select
+        e1 hour,
+        sum(money)
+    from
+        (
+            select
+                *
+            from
+                (
+                    select
+                        1 hour,
+                        10 money
+                    union
+                    all
+                    select
+                        3 hour,
+                        10 money
+                ) t lateral view explode([23,24]) tmp1 as e1
+            where
+                hour <= e1
+        ) tt
+    group by 1
+    order by 1;
+    """
+    sql """create view xx_lateral as select example1.col1 from (select col1,`col4`,col2 from t1 where col3<=115411) example1 lateral view explode([1,2,3]) tmp1 as `e1 aa`;"""
+    sql """drop view xx_lateral"""
 }

@@ -17,7 +17,6 @@
 
 package org.apache.doris.analysis;
 
-import org.apache.doris.catalog.ArrayType;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.PrimitiveType;
@@ -41,6 +40,8 @@ public class IndexDef {
     private IndexType indexType;
     private String comment;
     private Map<String, String> properties;
+    private boolean isBuildDeferred = false;
+    private PartitionNames partitionNames;
 
     public static final String NGRAM_SIZE_KEY = "gram_size";
     public static final String NGRAM_BF_SIZE_KEY = "bf_size";
@@ -53,7 +54,7 @@ public class IndexDef {
         this.ifNotExists = ifNotExists;
         this.columns = columns;
         if (indexType == null) {
-            this.indexType = IndexType.BITMAP;
+            this.indexType = IndexType.INVERTED;
         } else {
             this.indexType = indexType;
         }
@@ -68,12 +69,29 @@ public class IndexDef {
             this.properties = properties;
         }
         if (indexType == IndexType.NGRAM_BF) {
-            properties.putIfAbsent(NGRAM_SIZE_KEY, DEFAULT_NGRAM_SIZE);
-            properties.putIfAbsent(NGRAM_BF_SIZE_KEY, DEFAULT_NGRAM_BF_SIZE);
+            this.properties.putIfAbsent(NGRAM_SIZE_KEY, DEFAULT_NGRAM_SIZE);
+            this.properties.putIfAbsent(NGRAM_BF_SIZE_KEY, DEFAULT_NGRAM_BF_SIZE);
         }
     }
 
+    public IndexDef(String indexName, PartitionNames partitionNames, boolean isBuildDeferred) {
+        this.indexName = indexName;
+        this.indexType = IndexType.INVERTED;
+        this.partitionNames = partitionNames;
+        this.isBuildDeferred = isBuildDeferred;
+    }
+
     public void analyze() throws AnalysisException {
+        if (isBuildDeferred && indexType == IndexDef.IndexType.INVERTED) {
+            if (Strings.isNullOrEmpty(indexName)) {
+                throw new AnalysisException("index name cannot be blank.");
+            }
+            if (indexName.length() > 128) {
+                throw new AnalysisException("index name too long, the index name length at most is 128.");
+            }
+            return;
+        }
+
         if (indexType == IndexDef.IndexType.BITMAP
                 || indexType == IndexDef.IndexType.INVERTED) {
             if (columns == null || columns.size() != 1) {
@@ -103,23 +121,25 @@ public class IndexDef {
         if (tableName != null && !tableName.isEmpty()) {
             sb.append(" ON ").append(tableName);
         }
-        sb.append(" (");
-        boolean first = true;
-        for (String col : columns) {
-            if (first) {
-                first = false;
-            } else {
-                sb.append(",");
+        if (columns != null && columns.size() > 0) {
+            sb.append(" (");
+            boolean first = true;
+            for (String col : columns) {
+                if (first) {
+                    first = false;
+                } else {
+                    sb.append(",");
+                }
+                sb.append("`" + col + "`");
             }
-            sb.append("`" + col + "`");
+            sb.append(")");
         }
-        sb.append(")");
         if (indexType != null) {
             sb.append(" USING ").append(indexType.toString());
         }
         if (properties != null && properties.size() > 0) {
             sb.append(" PROPERTIES(");
-            first = true;
+            boolean first = true;
             for (Map.Entry<String, String> e : properties.entrySet()) {
                 if (first) {
                     first = false;
@@ -168,6 +188,14 @@ public class IndexDef {
         return ifNotExists;
     }
 
+    public boolean isBuildDeferred() {
+        return isBuildDeferred;
+    }
+
+    public List<String> getPartitionNames() {
+        return partitionNames == null ? Lists.newArrayList() : partitionNames.getPartitionNames();
+    }
+
     public enum IndexType {
         BITMAP,
         INVERTED,
@@ -179,23 +207,29 @@ public class IndexDef {
         return (this.indexType == IndexType.INVERTED);
     }
 
-    public void checkColumn(Column column, KeysType keysType) throws AnalysisException {
+    public void checkColumn(Column column, KeysType keysType, boolean enableUniqueKeyMergeOnWrite)
+            throws AnalysisException {
         if (indexType == IndexType.BITMAP || indexType == IndexType.INVERTED || indexType == IndexType.BLOOMFILTER
                 || indexType == IndexType.NGRAM_BF) {
             String indexColName = column.getName();
             caseSensitivityColumns.add(indexColName);
             PrimitiveType colType = column.getDataType();
-            if (indexType == IndexType.INVERTED && colType.isArrayType()) {
-                colType = ((ArrayType) column.getType()).getItemType().getPrimitiveType();
-            }
             if (!(colType.isDateType() || colType.isDecimalV2Type() || colType.isDecimalV3Type()
-                    || colType.isFixedPointType() || colType.isStringType() || colType == PrimitiveType.BOOLEAN)) {
+                    || colType.isFixedPointType() || colType.isStringType() || colType == PrimitiveType.BOOLEAN
+                    || colType.isVariantType() || colType.isIPType() || colType.isArrayType())) {
                 throw new AnalysisException(colType + " is not supported in " + indexType.toString() + " index. "
-                        + "invalid column: " + indexColName);
-            } else if ((keysType == KeysType.AGG_KEYS && !column.isKey())) {
-                throw new AnalysisException(indexType.toString()
-                        + " index only used in columns of DUP_KEYS/UNIQUE_KEYS table or key columns of"
-                                + " AGG_KEYS table. invalid column: " + indexColName);
+                        + "invalid index: " + indexName);
+            }
+            if (!column.isKey()) {
+                if (keysType == KeysType.AGG_KEYS) {
+                    throw new AnalysisException("index should only be used in columns of DUP_KEYS/UNIQUE_KEYS table"
+                        + " or key columns of AGG_KEYS table. invalid index: " + indexName);
+                } else if (keysType == KeysType.UNIQUE_KEYS && !enableUniqueKeyMergeOnWrite
+                               && indexType == IndexType.INVERTED && properties != null
+                               && properties.containsKey(InvertedIndexUtil.INVERTED_INDEX_PARSER_KEY)) {
+                    throw new AnalysisException("INVERTED index with parser can NOT be used in value columns of"
+                        + " UNIQUE_KEYS table with merge_on_write disable. invalid index: " + indexName);
+                }
             }
 
             if (indexType == IndexType.INVERTED) {
@@ -205,10 +239,6 @@ public class IndexDef {
                         && colType != PrimitiveType.STRING) {
                     throw new AnalysisException(colType + " is not supported in ngram_bf index. "
                                                     + "invalid column: " + indexColName);
-                } else if ((keysType == KeysType.AGG_KEYS && !column.isKey())) {
-                    throw new AnalysisException(
-                        "ngram_bf index only used in columns of DUP_KEYS/UNIQUE_KEYS table or key columns of"
-                        + " AGG_KEYS table. invalid column: " + indexColName);
                 }
                 if (properties.size() != 2) {
                     throw new AnalysisException("ngram_bf index should have gram_size and bf_size properties");
@@ -228,14 +258,6 @@ public class IndexDef {
             }
         } else {
             throw new AnalysisException("Unsupported index type: " + indexType);
-        }
-    }
-
-    public void checkColumns(List<Column> columns, KeysType keysType) throws AnalysisException {
-        if (indexType == IndexType.BITMAP || indexType == IndexType.INVERTED || indexType == IndexType.BLOOMFILTER) {
-            for (Column col : columns) {
-                checkColumn(col, keysType);
-            }
         }
     }
 }

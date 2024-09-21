@@ -17,25 +17,16 @@
 
 #pragma once
 
-#include <cstdint>
+#include <gen_cpp/parquet_types.h>
+#include <stddef.h>
 
-#include "common/status.h"
-#include "gen_cpp/parquet_types.h"
-#include "gutil/endian.h"
-#include "schema_desc.h"
-#include "util/bit_stream_utils.inline.h"
-#include "util/coding.h"
-#include "util/rle_encoding.h"
-#include "util/simd/bits.h"
-#include "vec/columns/column_array.h"
-#include "vec/columns/column_dictionary.h"
+#include <cstdint>
+#include <ostream>
+#include <regex>
+#include <string>
+#include <vector>
+
 #include "vec/columns/column_nullable.h"
-#include "vec/columns/column_string.h"
-#include "vec/common/int_exp.h"
-#include "vec/data_types/data_type.h"
-#include "vec/data_types/data_type_decimal.h"
-#include "vec/data_types/data_type_nullable.h"
-#include "vec/exec/format/format_common.h"
 
 namespace doris::vectorized {
 
@@ -57,26 +48,23 @@ struct RowRange {
     }
 };
 
-struct ParquetReadColumn {
-    ParquetReadColumn(int parquet_col_id, const std::string& file_slot_name)
-            : _parquet_col_id(parquet_col_id), _file_slot_name(file_slot_name) {};
-
-    int _parquet_col_id;
-    const std::string& _file_slot_name;
-};
-
 #pragma pack(1)
 struct ParquetInt96 {
-    uint64_t lo; // time of nanoseconds in a day
-    uint32_t hi; // days from julian epoch
+    int64_t lo; // time of nanoseconds in a day
+    int32_t hi; // days from julian epoch
 
-    inline uint64_t to_timestamp_micros() const {
+    inline int64_t to_timestamp_micros() const {
         return (hi - JULIAN_EPOCH_OFFSET_DAYS) * MICROS_IN_DAY + lo / NANOS_PER_MICROSECOND;
     }
+    inline __int128 to_int128() const {
+        __int128 ans = 0;
+        ans = (((__int128)hi) << 64) + lo;
+        return ans;
+    }
 
-    static const uint32_t JULIAN_EPOCH_OFFSET_DAYS;
-    static const uint64_t MICROS_IN_DAY;
-    static const uint64_t NANOS_PER_MICROSECOND;
+    static const int32_t JULIAN_EPOCH_OFFSET_DAYS;
+    static const int64_t MICROS_IN_DAY;
+    static const int64_t NANOS_PER_MICROSECOND;
 };
 #pragma pack()
 static_assert(sizeof(ParquetInt96) == 12, "The size of ParquetInt96 is not 12.");
@@ -117,7 +105,37 @@ public:
         }
     }
 
-    size_t get_next_run(DataReadType* data_read_type);
+    template <bool has_filter>
+    size_t get_next_run(DataReadType* data_read_type) {
+        DCHECK_EQ(_has_filter, has_filter);
+        if constexpr (has_filter) {
+            if (_read_index == _num_values) {
+                return 0;
+            }
+            const DataReadType& type = _data_map[_read_index++];
+            size_t run_length = 1;
+            while (_read_index < _num_values) {
+                if (_data_map[_read_index] == type) {
+                    run_length++;
+                    _read_index++;
+                } else {
+                    break;
+                }
+            }
+            *data_read_type = type;
+            return run_length;
+        } else {
+            size_t run_length = 0;
+            while (run_length == 0) {
+                if (_read_index == (*_run_length_null_map).size()) {
+                    return 0;
+                }
+                *data_read_type = _read_index % 2 == 0 ? CONTENT : NULL_DATA;
+                run_length = (*_run_length_null_map)[_read_index++];
+            }
+            return run_length;
+        }
+    }
 
     void set_run_length_null_map(const std::vector<uint16_t>& run_length_null_map,
                                  size_t num_values, NullMap* null_map = nullptr);
@@ -140,4 +158,131 @@ private:
     size_t _num_filtered;
     size_t _read_index;
 };
+
+enum class ColumnOrderName { UNDEFINED, TYPE_DEFINED_ORDER };
+
+enum class SortOrder { SIGNED, UNSIGNED, UNKNOWN };
+
+class ParsedVersion {
+public:
+    ParsedVersion(std::string application, std::optional<std::string> version,
+                  std::optional<std::string> app_build_hash);
+
+    const std::string& application() const { return _application; }
+
+    const std::optional<std::string>& version() const { return _version; }
+
+    const std::optional<std::string>& app_build_hash() const { return _app_build_hash; }
+
+    bool operator==(const ParsedVersion& other) const;
+
+    bool operator!=(const ParsedVersion& other) const;
+
+    size_t hash() const;
+
+    std::string to_string() const;
+
+private:
+    std::string _application;
+    std::optional<std::string> _version;
+    std::optional<std::string> _app_build_hash;
+};
+
+class VersionParser {
+public:
+    static Status parse(const std::string& created_by,
+                        std::unique_ptr<ParsedVersion>* parsed_version);
+};
+
+class SemanticVersion {
+public:
+    SemanticVersion(int major, int minor, int patch);
+
+#ifdef BE_TEST
+    SemanticVersion(int major, int minor, int patch, bool has_unknown);
+#endif
+
+    SemanticVersion(int major, int minor, int patch, std::optional<std::string> unknown,
+                    std::optional<std::string> pre, std::optional<std::string> build_info);
+
+    static Status parse(const std::string& version,
+                        std::unique_ptr<SemanticVersion>* semantic_version);
+
+    int compare_to(const SemanticVersion& other) const;
+
+    bool operator==(const SemanticVersion& other) const;
+
+    bool operator!=(const SemanticVersion& other) const;
+
+    std::string to_string() const;
+
+private:
+    class NumberOrString {
+    public:
+        explicit NumberOrString(const std::string& value_string);
+
+        NumberOrString(const NumberOrString& other);
+
+        int compare_to(const NumberOrString& that) const;
+        std::string to_string() const;
+
+        bool operator<(const NumberOrString& that) const;
+        bool operator==(const NumberOrString& that) const;
+        bool operator!=(const NumberOrString& that) const;
+        bool operator>(const NumberOrString& that) const;
+        bool operator<=(const NumberOrString& that) const;
+        bool operator>=(const NumberOrString& that) const;
+
+    private:
+        std::string _original;
+        bool _is_numeric;
+        int _number;
+    };
+
+    class Prerelease {
+    public:
+        explicit Prerelease(std::string original);
+
+        int compare_to(const Prerelease& that) const;
+        std::string to_string() const;
+
+        bool operator<(const Prerelease& that) const;
+        bool operator==(const Prerelease& that) const;
+        bool operator!=(const Prerelease& that) const;
+        bool operator>(const Prerelease& that) const;
+        bool operator<=(const Prerelease& that) const;
+        bool operator>=(const Prerelease& that) const;
+
+        const std::string& original() const { return _original; }
+
+    private:
+        static std::vector<std::string> _split(const std::string& s, const std::regex& delimiter);
+
+        std::string _original;
+        std::vector<NumberOrString> _identifiers;
+    };
+
+    static int _compare_integers(int x, int y);
+    static int _compare_booleans(bool x, bool y);
+
+    int _major;
+    int _minor;
+    int _patch;
+    bool _prerelease;
+    std::optional<std::string> _unknown;
+    std::optional<Prerelease> _pre;
+    std::optional<std::string> _build_info;
+};
+
+class CorruptStatistics {
+public:
+    static bool should_ignore_statistics(const std::string& created_by,
+                                         tparquet::Type::type physical_type);
+
+private:
+    static const SemanticVersion PARQUET_251_FIXED_VERSION;
+    static const SemanticVersion CDH_5_PARQUET_251_FIXED_START;
+    static const SemanticVersion CDH_5_PARQUET_251_FIXED_END;
+};
+
 } // namespace doris::vectorized

@@ -17,42 +17,49 @@
 
 package org.apache.doris.nereids.trees.plans.logical;
 
-import org.apache.doris.catalog.external.ExternalTable;
+import org.apache.doris.catalog.JdbcTable;
+import org.apache.doris.catalog.TableIf;
+import org.apache.doris.datasource.ExternalTable;
 import org.apache.doris.nereids.memo.GroupExpression;
 import org.apache.doris.nereids.properties.LogicalProperties;
-import org.apache.doris.nereids.trees.plans.ObjectId;
+import org.apache.doris.nereids.trees.expressions.Expression;
+import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
+import org.apache.doris.nereids.trees.plans.RelationId;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.nereids.util.Utils;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableSet;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 /**
- * Logical scan for external jdbc catalog.
+ * Logical scan for external jdbc catalog and jdbc table.
  */
-public class LogicalJdbcScan extends LogicalRelation {
+public class LogicalJdbcScan extends LogicalExternalRelation {
 
     /**
      * Constructor for LogicalJdbcScan.
      */
-    public LogicalJdbcScan(ObjectId id, ExternalTable table, List<String> qualifier,
+    public LogicalJdbcScan(RelationId id, TableIf table, List<String> qualifier,
                            Optional<GroupExpression> groupExpression,
-                           Optional<LogicalProperties> logicalProperties) {
-        super(id, PlanType.LOGICAL_JDBC_SCAN, table, qualifier,
-                groupExpression, logicalProperties);
+                           Optional<LogicalProperties> logicalProperties,
+                           Set<Expression> conjuncts) {
+        super(id, PlanType.LOGICAL_JDBC_SCAN, table, qualifier, conjuncts, groupExpression, logicalProperties);
     }
 
-    public LogicalJdbcScan(ObjectId id, ExternalTable table, List<String> qualifier) {
-        this(id, table, qualifier, Optional.empty(), Optional.empty());
+    public LogicalJdbcScan(RelationId id, TableIf table, List<String> qualifier) {
+        this(id, table, qualifier, Optional.empty(), Optional.empty(), ImmutableSet.of());
     }
 
     @Override
-    public ExternalTable getTable() {
-        Preconditions.checkArgument(table instanceof ExternalTable);
-        return (ExternalTable) table;
+    public TableIf getTable() {
+        Preconditions.checkArgument(table instanceof ExternalTable || table instanceof JdbcTable,
+                String.format("Table %s is neither ExternalTable nor JdbcTable", table.getName()));
+        return table;
     }
 
     @Override
@@ -65,19 +72,29 @@ public class LogicalJdbcScan extends LogicalRelation {
 
     @Override
     public LogicalJdbcScan withGroupExpression(Optional<GroupExpression> groupExpression) {
-        return new LogicalJdbcScan(id, (ExternalTable) table, qualifier, groupExpression,
-            Optional.of(getLogicalProperties()));
+        return new LogicalJdbcScan(relationId, table, qualifier, groupExpression,
+            Optional.of(getLogicalProperties()), conjuncts);
     }
 
     @Override
-    public LogicalJdbcScan withLogicalProperties(Optional<LogicalProperties> logicalProperties) {
-        return new LogicalJdbcScan(id, (ExternalTable) table, qualifier, groupExpression,
-            logicalProperties);
+    public LogicalJdbcScan withConjuncts(Set<Expression> conjuncts) {
+        return new LogicalJdbcScan(relationId, table, qualifier, Optional.empty(),
+            Optional.of(getLogicalProperties()), conjuncts);
+    }
+
+    @Override
+    public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
+            Optional<LogicalProperties> logicalProperties, List<Plan> children) {
+        return new LogicalJdbcScan(relationId, table, qualifier, groupExpression, logicalProperties, conjuncts);
+    }
+
+    @Override
+    public LogicalJdbcScan withRelationId(RelationId relationId) {
+        return new LogicalJdbcScan(relationId, table, qualifier, Optional.empty(), Optional.empty(), conjuncts);
     }
 
     @Override
     public <R, C> R accept(PlanVisitor<R, C> visitor, C context) {
         return visitor.visitLogicalJdbcScan(this, context);
     }
-
 }

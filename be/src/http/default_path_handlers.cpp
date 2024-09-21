@@ -17,24 +17,36 @@
 
 #include "http/default_path_handlers.h"
 
-#include <gperftools/heap-profiler.h>
+#include <gen_cpp/Metrics_types.h>
+
+#include <boost/algorithm/string/replace.hpp>
 #ifdef USE_JEMALLOC
 #include "jemalloc/jemalloc.h"
-#else
+#endif
+#if !defined(__SANITIZE_ADDRESS__) && !defined(ADDRESS_SANITIZER) && !defined(LEAK_SANITIZER) && \
+        !defined(THREAD_SANITIZER) && !defined(USE_JEMALLOC)
 #include <gperftools/malloc_extension.h>
 #endif
 
-#include <boost/algorithm/string.hpp>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "agent/utils.h"
-#include "common/configbase.h"
+#include "common/config.h"
 #include "gutil/strings/numbers.h"
 #include "gutil/strings/substitute.h"
 #include "http/action/tablets_info_action.h"
 #include "http/web_page_handler.h"
+#include "runtime/memory/global_memory_arbitrator.h"
+#include "runtime/memory/mem_tracker.h"
 #include "runtime/memory/mem_tracker_limiter.h"
-#include "util/debug_util.h"
+#include "util/easy_json.h"
+#include "util/mem_info.h"
 #include "util/perf_counters.h"
 #include "util/pretty_printer.h"
 #include "util/thread.h"
@@ -117,21 +129,20 @@ void mem_usage_handler(const WebPageHandler::ArgumentMap& args, std::stringstrea
 }
 
 void display_tablets_callback(const WebPageHandler::ArgumentMap& args, EasyJson* ej) {
-    TabletsInfoAction tablet_info_action;
     std::string tablet_num_to_return;
-    WebPageHandler::ArgumentMap::const_iterator it = args.find("limit");
+    auto it = args.find("limit");
     if (it != args.end()) {
         tablet_num_to_return = it->second;
     } else {
         tablet_num_to_return = "1000"; // default
     }
-    (*ej) = tablet_info_action.get_tablets_info(tablet_num_to_return);
+    (*ej) = TabletsInfoAction::get_tablets_info(tablet_num_to_return);
 }
 
 // Registered to handle "/mem_tracker", and prints out memory tracker information.
 void mem_tracker_handler(const WebPageHandler::ArgumentMap& args, std::stringstream* output) {
     (*output) << "<h1>Memory usage by subsystem</h1>\n";
-    std::vector<MemTracker::Snapshot> snapshots;
+    std::vector<MemTrackerLimiter::Snapshot> snapshots;
     auto iter = args.find("type");
     if (iter != args.end()) {
         if (iter->second == "global") {
@@ -145,22 +156,31 @@ void mem_tracker_handler(const WebPageHandler::ArgumentMap& args, std::stringstr
         } else if (iter->second == "schema_change") {
             MemTrackerLimiter::make_type_snapshots(&snapshots,
                                                    MemTrackerLimiter::Type::SCHEMA_CHANGE);
-        } else if (iter->second == "clone") {
-            MemTrackerLimiter::make_type_snapshots(&snapshots, MemTrackerLimiter::Type::CLONE);
-        } else if (iter->second == "experimental") {
-            MemTrackerLimiter::make_type_snapshots(&snapshots,
-                                                   MemTrackerLimiter::Type::EXPERIMENTAL);
+        } else if (iter->second == "other") {
+            MemTrackerLimiter::make_type_snapshots(&snapshots, MemTrackerLimiter::Type::OTHER);
+        } else if (iter->second == "reserved_memory") {
+            MemTrackerLimiter::make_all_reserved_trackers_snapshots(&snapshots);
+        } else if (iter->second == "all") {
+            MemTrackerLimiter::make_all_memory_state_snapshots(&snapshots);
         }
     } else {
-        (*output) << "<h4>*Note: (see documentation for details)</h4>\n";
-        (*output) << "<h4>     1.`/mem_tracker?type=global` to view the memory statistics of each "
-                     "type, `global`life cycle is the same as the process, e.g. each Cache, "
-                     "StorageEngine, each Manager.</h4>\n";
-        (*output) << "<h4>     2.`/mem_tracker` counts virtual memory, which is equal to `Actual "
-                     "memory used` in `/memz`</h4>\n";
-        (*output) << "<h4>     3.`process` is equal to the sum of all types of memory, "
-                     "`/mem_tracker` can be logically divided into 4 layers: 1)`process` 2)`type` "
-                     "3)`query/load/compation task etc.` 4)`exec node etc.`</h4>\n";
+        (*output) << "<h4>*Notice:</h4>\n";
+        (*output) << "<h4>    1. MemTracker only counts the memory on part of the main execution "
+                     "path, "
+                     "which is usually less than the real process memory.</h4>\n";
+        (*output) << "<h4>    2. each `type` is the sum of a set of tracker values, "
+                     "`sum of all trackers` is the sum of all trackers of all types, .</h4>\n";
+        (*output) << "<h4>    3. `process resident memory` is the physical memory of the process, "
+                     "from /proc VmRSS VmHWM.</h4>\n";
+        (*output) << "<h4>    4. `process virtual memory` is the virtual memory of the process, "
+                     "from /proc VmSize VmPeak.</h4>\n";
+        (*output) << "<h4>    5.`/mem_tracker?type=<type name>` to view the memory details of each "
+                     "type, for example, `/mem_tracker?type=query` will list the memory of all "
+                     "queries; "
+                     "`/mem_tracker?type=global` will list the memory of all Cache, metadata and "
+                     "other "
+                     "global life cycles.</h4>\n";
+        (*output) << "<h4>see documentation for details.";
         MemTrackerLimiter::make_process_snapshots(&snapshots);
     }
 
@@ -171,7 +191,6 @@ void mem_tracker_handler(const WebPageHandler::ArgumentMap& args, std::stringstr
     (*output) << "<thead><tr>"
                  "<th data-sortable='true'>Type</th>"
                  "<th data-sortable='true'>Label</th>"
-                 "<th data-sortable='true'>Parent Label</th>"
                  "<th>Limit</th>"
                  "<th data-sortable='true' "
                  ">Current Consumption(Bytes)</th>"
@@ -187,8 +206,8 @@ void mem_tracker_handler(const WebPageHandler::ArgumentMap& args, std::stringstr
         string peak_consumption_normalize = AccurateItoaKMGT(item.peak_consumption);
         (*output) << strings::Substitute(
                 "<tr><td>$0</td><td>$1</td><td>$2</td><td>$3</td><td>$4</td><td>$5</td><td>$6</"
-                "td><td>$7</td></tr>\n",
-                item.type, item.label, item.parent_label, limit_str, item.cur_consumption,
+                "td></tr>\n",
+                item.type, item.label, limit_str, item.cur_consumption,
                 current_consumption_normalize, item.peak_consumption, peak_consumption_normalize);
     }
     (*output) << "</tbody></table>\n";
@@ -263,8 +282,7 @@ void heap_handler(const WebPageHandler::ArgumentMap& args, std::stringstream* ou
 void cpu_handler(const WebPageHandler::ArgumentMap& args, std::stringstream* output) {
     (*output) << "<h2>CPU Profile</h2>" << std::endl;
 
-#if defined(ADDRESS_SANITIZER) || defined(LEAK_SANITIZER) || defined(THREAD_SANITIZER) || \
-        defined(USE_JEMALLOC)
+#if defined(ADDRESS_SANITIZER) || defined(LEAK_SANITIZER) || defined(THREAD_SANITIZER)
     (*output) << "<pre>" << std::endl;
     (*output) << "CPU profiling is not available with address sanitizer builds." << std::endl;
     (*output) << "</pre>" << std::endl;
@@ -295,7 +313,8 @@ void cpu_handler(const WebPageHandler::ArgumentMap& args, std::stringstream* out
               << std::endl;
     (*output) << "And you need to download the FlameGraph and place it under 'be/tools/FlameGraph'."
               << std::endl;
-    (*output) << "Finally, check if the following files exist" << std::endl;
+    (*output) << "Finally, check if the following files exist. And should be executable."
+              << std::endl;
     (*output) << std::endl;
     (*output) << "    be/tools/FlameGraph/stackcollapse-perf.pl" << std::endl;
     (*output) << "    be/tools/FlameGraph/flamegraph.pl" << std::endl;
@@ -315,9 +334,6 @@ void cpu_handler(const WebPageHandler::ArgumentMap& args, std::stringstream* out
             << std::endl;
     (*output) << "    <br/>" << std::endl;
     (*output) << "    <div id=\"cpuResult\"><pre id=\"cpuContent\"></pre></div>" << std::endl;
-    (*output) << "    <br/>" << std::endl;
-    (*output) << "    <div id=\"cpuResultGraph\"><pre id=\"cpuContentGraph\"></pre></div>"
-              << std::endl;
     (*output) << "</div>" << std::endl;
 
     // for text profile
@@ -330,14 +346,14 @@ void cpu_handler(const WebPageHandler::ArgumentMap& args, std::stringstream* out
     (*output) << "        type: \"GET\"," << std::endl;
     (*output) << "        dataType: \"text\"," << std::endl;
     (*output) << "        url: \"pprof/profile?type=text\"," << std::endl;
-    (*output) << "        timeout: 60000," << std::endl;
+    (*output) << "        timeout: 120000," << std::endl;
     (*output) << "        success: function (result) {" << std::endl;
     (*output) << "            document.getElementById(\"cpuContent\").innerText = result;"
               << std::endl;
     (*output) << "        }" << std::endl;
     (*output) << "        ," << std::endl;
     (*output) << "        error: function (result) {" << std::endl;
-    (*output) << "            alert(result);" << std::endl;
+    (*output) << "            alert(JSON.stringify(result));" << std::endl;
     (*output) << "        }" << std::endl;
     (*output) << "        ," << std::endl;
     (*output) << "    });" << std::endl;
@@ -345,21 +361,21 @@ void cpu_handler(const WebPageHandler::ArgumentMap& args, std::stringstream* out
 
     // for graph profile
     (*output) << "$('#getCpuGraph').click(function () {" << std::endl;
-    (*output) << "    document.getElementById(\"cpuContentGraph\").innerText = \"Sampling... (30 "
+    (*output) << "    document.getElementById(\"cpuContent\").innerText = \"Sampling... (30 "
                  "seconds)\";"
               << std::endl;
     (*output) << "    $.ajax({" << std::endl;
     (*output) << "        type: \"GET\"," << std::endl;
     (*output) << "        dataType: \"text\"," << std::endl;
     (*output) << "        url: \"pprof/profile?type=flamegraph\"," << std::endl;
-    (*output) << "        timeout: 60000," << std::endl;
+    (*output) << "        timeout: 120000," << std::endl;
     (*output) << "        success: function (result) {" << std::endl;
-    (*output) << "            document.getElementById(\"cpuResultGraph\").innerHTML = result;"
+    (*output) << "            document.getElementById(\"cpuContent\").innerHTML = result;"
               << std::endl;
     (*output) << "        }" << std::endl;
     (*output) << "        ," << std::endl;
     (*output) << "        error: function (result) {" << std::endl;
-    (*output) << "            alert(result);" << std::endl;
+    (*output) << "            alert(JSON.stringify(result));" << std::endl;
     (*output) << "        }" << std::endl;
     (*output) << "        ," << std::endl;
     (*output) << "    });" << std::endl;
@@ -381,7 +397,10 @@ void add_default_path_handlers(WebPageHandler* web_page_handler) {
     web_page_handler->register_page("/memz", "Memory", mem_usage_handler, true /* is_on_nav_bar */);
     web_page_handler->register_page(
             "/mem_tracker", "MemTracker",
-            std::bind<void>(&mem_tracker_handler, std::placeholders::_1, std::placeholders::_2),
+            [](auto&& PH1, auto&& PH2) {
+                return mem_tracker_handler(std::forward<decltype(PH1)>(PH1),
+                                           std::forward<decltype(PH2)>(PH2));
+            },
             true /* is_on_nav_bar */);
     web_page_handler->register_page("/heap", "Heap Profile", heap_handler,
                                     true /* is_on_nav_bar */);
@@ -389,8 +408,10 @@ void add_default_path_handlers(WebPageHandler* web_page_handler) {
     register_thread_display_page(web_page_handler);
     web_page_handler->register_template_page(
             "/tablets_page", "Tablets",
-            std::bind<void>(&display_tablets_callback, std::placeholders::_1,
-                            std::placeholders::_2),
+            [](auto&& PH1, auto&& PH2) {
+                return display_tablets_callback(std::forward<decltype(PH1)>(PH1),
+                                                std::forward<decltype(PH2)>(PH2));
+            },
             true /* is_on_nav_bar */);
 }
 

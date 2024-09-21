@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("literal_view_test") {
+suite("literal_view_test", "arrow_flight_sql") {
 
     sql """DROP TABLE IF EXISTS table1"""
 
@@ -106,6 +106,13 @@ suite("literal_view_test") {
         insert into test_insert values (1,'doris',10),(2,'spark',2),(3,'flink',20);
     """
 
+    order_qt_left """select * 
+        from test_insert 
+        left join (select 1 as v1) t1 
+        on false 
+        where t1.v1 is null
+    """
+
     qt_sql1 """
         select id, name
         from (
@@ -116,4 +123,19 @@ suite("literal_view_test") {
         ) a
         where name != '1234';
     """
+
+    test {
+        sql "select * from (select null as top) t where top is not null"
+        result ([])
+    }
+
+    test {
+        sql "select * from (select null as top) t where top is null"
+        result ([[null]])
+    }
+
+    test {
+        sql "select * from (select null as top) t where top = 5"
+        result ([])
+    }
 }

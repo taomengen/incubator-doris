@@ -17,14 +17,15 @@
 
 package org.apache.doris.nereids.util;
 
-import org.apache.doris.catalog.Table;
-import org.apache.doris.common.jmockit.Deencapsulation;
+import org.apache.doris.catalog.TableIf;
 import org.apache.doris.nereids.CascadesContext;
 import org.apache.doris.nereids.NereidsPlanner;
 import org.apache.doris.nereids.StatementContext;
 import org.apache.doris.nereids.datasets.ssb.SSBTestBase;
 import org.apache.doris.nereids.parser.NereidsParser;
 import org.apache.doris.nereids.properties.PhysicalProperties;
+import org.apache.doris.nereids.trees.plans.commands.insert.InsertIntoTableCommand;
+import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
@@ -42,15 +43,15 @@ public class ReadLockTest extends SSBTestBase {
         String sql = "SELECT s_suppkey FROM supplier";
         StatementContext statementContext = MemoTestUtils.createStatementContext(connectContext, sql);
         NereidsPlanner planner = new NereidsPlanner(statementContext);
-        planner.plan(
+        planner.planWithLock(
                 parser.parseSingle(sql),
                 PhysicalProperties.ANY
         );
         CascadesContext cascadesContext = planner.getCascadesContext();
-        List<Table> f = (List<Table>) Deencapsulation.getField(cascadesContext, "tables");
-        Assertions.assertEquals(1, f.size());
-        Assertions.assertEquals("supplier", f.stream().map(Table::getName).findFirst().get());
 
+        List<TableIf> f = cascadesContext.getTables();
+        Assertions.assertEquals(1, f.size());
+        Assertions.assertEquals("supplier", f.stream().map(TableIf::getName).findFirst().get());
     }
 
     @Test
@@ -64,14 +65,14 @@ public class ReadLockTest extends SSBTestBase {
                 + "        FROM cte1 as t1, cte1 as t2";
         StatementContext statementContext = MemoTestUtils.createStatementContext(connectContext, sql);
         NereidsPlanner planner = new NereidsPlanner(statementContext);
-        planner.plan(
+        planner.planWithLock(
                 parser.parseSingle(sql),
                 PhysicalProperties.ANY
         );
         CascadesContext cascadesContext = planner.getCascadesContext();
-        List<Table> f = (List<Table>) Deencapsulation.getField(cascadesContext, "tables");
+        List<TableIf> f = cascadesContext.getTables();
         Assertions.assertEquals(1, f.size());
-        Assertions.assertEquals("supplier", f.stream().map(Table::getName).findFirst().get());
+        Assertions.assertEquals("supplier", f.stream().map(TableIf::getName).findFirst().get());
     }
 
     @Test
@@ -79,15 +80,14 @@ public class ReadLockTest extends SSBTestBase {
         String sql = "SELECT s_suppkey FROM (SELECT * FROM supplier) t";
         StatementContext statementContext = MemoTestUtils.createStatementContext(connectContext, sql);
         NereidsPlanner planner = new NereidsPlanner(statementContext);
-        planner.plan(
+        planner.planWithLock(
                 parser.parseSingle(sql),
                 PhysicalProperties.ANY
         );
         CascadesContext cascadesContext = planner.getCascadesContext();
-        List<Table> f = (List<Table>) Deencapsulation.getField(cascadesContext, "tables");
-
+        List<TableIf> f = cascadesContext.getTables();
         Assertions.assertEquals(1, f.size());
-        Assertions.assertEquals("supplier", f.stream().map(Table::getName).findFirst().get());
+        Assertions.assertEquals("supplier", f.stream().map(TableIf::getName).findFirst().get());
     }
 
     @Test
@@ -95,16 +95,34 @@ public class ReadLockTest extends SSBTestBase {
         String sql = "SELECT s_suppkey FROM supplier WHERE s_suppkey > (SELECT MAX(lo_orderkey) FROM lineorder)";
         StatementContext statementContext = MemoTestUtils.createStatementContext(connectContext, sql);
         NereidsPlanner planner = new NereidsPlanner(statementContext);
-        planner.plan(
+        planner.planWithLock(
                 parser.parseSingle(sql),
                 PhysicalProperties.ANY
         );
         CascadesContext cascadesContext = planner.getCascadesContext();
-        List<Table> f = (List<Table>) Deencapsulation.getField(cascadesContext, "tables");
+        List<TableIf> f = cascadesContext.getTables();
         Assertions.assertEquals(2, f.size());
-        Set<String> tableNames = f.stream().map(Table::getName).collect(Collectors.toSet());
+        Set<String> tableNames = f.stream().map(TableIf::getName).collect(Collectors.toSet());
         Assertions.assertTrue(tableNames.contains("supplier"));
         Assertions.assertTrue(tableNames.contains("lineorder"));
+    }
 
+    @Test
+    public void testInserInto() {
+        String sql = "INSERT INTO supplier(s_suppkey, s_name, s_address, s_city, s_nation, s_region, s_phone) "
+                + "SELECT lo_orderkey, '', '', '', '', '', '' FROM lineorder";
+        StatementContext statementContext = MemoTestUtils.createStatementContext(connectContext, sql);
+        InsertIntoTableCommand insertIntoTableCommand = (InsertIntoTableCommand) parser.parseSingle(sql);
+        NereidsPlanner planner = new NereidsPlanner(statementContext);
+        planner.planWithLock(
+                (LogicalPlan) insertIntoTableCommand.getExplainPlan(connectContext),
+                PhysicalProperties.ANY
+        );
+        CascadesContext cascadesContext = planner.getCascadesContext();
+        List<TableIf> f = cascadesContext.getTables();
+        Assertions.assertEquals(2, f.size());
+        Set<String> tableNames = f.stream().map(TableIf::getName).collect(Collectors.toSet());
+        Assertions.assertTrue(tableNames.contains("supplier"));
+        Assertions.assertTrue(tableNames.contains("lineorder"));
     }
 }

@@ -17,440 +17,431 @@
 
 #include "io/fs/s3_file_system.h"
 
+#include <fmt/format.h>
+
+#include <cstddef>
+
+#include "common/compiler_util.h" // IWYU pragma: keep
+// IWYU pragma: no_include <bits/chrono.h>
 #include <aws/core/utils/threading/Executor.h>
 #include <aws/s3/S3Client.h>
-#include <aws/s3/model/CopyObjectRequest.h>
-#include <aws/s3/model/DeleteObjectRequest.h>
-#include <aws/s3/model/DeleteObjectsRequest.h>
-#include <aws/s3/model/HeadObjectRequest.h>
-#include <aws/s3/model/ListObjectsV2Request.h>
-#include <aws/s3/model/PutObjectRequest.h>
-#include <aws/transfer/TransferManager.h>
-#include <opentelemetry/common/threadlocal.h>
 
+#include <chrono> // IWYU pragma: keep
 #include <filesystem>
-#include <fstream>
+#include <fstream> // IWYU pragma: keep
+#include <future>
 #include <memory>
 
 #include "common/config.h"
+#include "common/logging.h"
 #include "common/status.h"
-#include "gutil/strings/stringpiece.h"
-#include "io/cache/block/cached_remote_file_reader.h"
+#include "io/fs/err_utils.h"
+#include "io/fs/file_system.h"
+#include "io/fs/file_writer.h"
+#include "io/fs/local_file_system.h"
 #include "io/fs/remote_file_system.h"
+#include "io/fs/s3_common.h"
 #include "io/fs/s3_file_reader.h"
 #include "io/fs/s3_file_writer.h"
-#include "util/async_io.h"
+#include "io/fs/s3_obj_storage_client.h"
+#include "runtime/exec_env.h"
+#include "util/s3_uri.h"
+#include "util/s3_util.h"
 
-namespace doris {
-namespace io {
+namespace doris::io {
+namespace {
+constexpr std::string_view OSS_PRIVATE_ENDPOINT_SUFFIX = "-internal.aliyuncs.com";
+constexpr int LEN_OF_OSS_PRIVATE_SUFFIX = 9; // length of "-internal"
 
 #ifndef CHECK_S3_CLIENT
-#define CHECK_S3_CLIENT(client)                               \
-    if (!client) {                                            \
-        return Status::InternalError("init s3 client error"); \
+#define CHECK_S3_CLIENT(client)                                 \
+    if (!client) {                                              \
+        return Status::InvalidArgument("init s3 client error"); \
     }
 #endif
 
-std::shared_ptr<S3FileSystem> S3FileSystem::create(S3Conf s3_conf, std::string id) {
-    return std::shared_ptr<S3FileSystem>(new S3FileSystem(std::move(s3_conf), std::move(id)));
+Result<std::string> get_key(const Path& full_path) {
+    // FIXME(plat1ko): Check bucket in full path and support relative path
+    S3URI uri(full_path.native());
+    RETURN_IF_ERROR_RESULT(uri.parse());
+    return uri.get_key();
 }
 
-S3FileSystem::S3FileSystem(S3Conf&& s3_conf, std::string&& id)
-        : RemoteFileSystem(
-                  fmt::format("{}/{}/{}", s3_conf.endpoint, s3_conf.bucket, s3_conf.prefix),
-                  std::move(id), FileSystemType::S3),
-          _s3_conf(std::move(s3_conf)) {
-    if (_s3_conf.prefix.size() > 0 && _s3_conf.prefix[0] == '/') {
-        _s3_conf.prefix = _s3_conf.prefix.substr(1);
+} // namespace
+
+ObjClientHolder::ObjClientHolder(S3ClientConf conf) : _conf(std::move(conf)) {}
+
+ObjClientHolder::~ObjClientHolder() = default;
+
+Status ObjClientHolder::init() {
+    _client = S3ClientFactory::instance().create(_conf);
+    if (!_client) {
+        return Status::InvalidArgument("failed to init s3 client with conf {}", _conf.to_string());
     }
-    if (!_s3_conf.prefix.empty() && _s3_conf.prefix.back() == '/') {
-        _s3_conf.prefix.pop_back();
+
+    return Status::OK();
+}
+
+Status ObjClientHolder::reset(const S3ClientConf& conf) {
+    S3ClientConf reset_conf;
+    {
+        std::shared_lock lock(_mtx);
+        if (conf.ak == _conf.ak && conf.sk == _conf.sk && conf.token == _conf.token) {
+            return Status::OK(); // Same conf
+        }
+
+        reset_conf = _conf;
+        reset_conf.ak = conf.ak;
+        reset_conf.sk = conf.sk;
+        reset_conf.token = conf.token;
+        reset_conf.bucket = conf.bucket;
+        // Should check endpoint here?
     }
-    _executor = Aws::MakeShared<Aws::Utils::Threading::PooledThreadExecutor>(
-            id.c_str(), config::s3_transfer_executor_pool_size);
+
+    auto client = S3ClientFactory::instance().create(reset_conf);
+    if (!client) {
+        return Status::InvalidArgument("failed to init s3 client with conf {}", conf.to_string());
+    }
+
+    LOG(INFO) << "reset s3 client with new conf: " << conf.to_string();
+
+    {
+        std::lock_guard lock(_mtx);
+        _client = std::move(client);
+        _conf = std::move(reset_conf);
+    }
+
+    return Status::OK();
+}
+
+Result<int64_t> ObjClientHolder::object_file_size(const std::string& bucket,
+                                                  const std::string& key) const {
+    auto client = get();
+    if (!client) {
+        return ResultError(Status::InvalidArgument("init s3 client error"));
+    }
+
+    auto resp = client->head_object({
+            .bucket = bucket,
+            .key = key,
+    });
+
+    if (resp.resp.status.code != ErrorCode::OK) {
+        return ResultError(std::move(Status(resp.resp.status.code, std::move(resp.resp.status.msg))
+                                             .append(fmt::format("failed to head s3 file {}",
+                                                                 full_s3_path(bucket, key)))));
+    }
+
+    return resp.file_size;
+}
+
+std::string ObjClientHolder::full_s3_path(std::string_view bucket, std::string_view key) const {
+    return fmt::format("{}/{}/{}", _conf.endpoint, bucket, key);
+}
+
+std::string S3FileSystem::full_s3_path(std::string_view key) const {
+    return _client->full_s3_path(_bucket, key);
+}
+
+Result<std::shared_ptr<S3FileSystem>> S3FileSystem::create(S3Conf s3_conf, std::string id) {
+    std::shared_ptr<S3FileSystem> fs(new S3FileSystem(std::move(s3_conf), std::move(id)));
+    RETURN_IF_ERROR_RESULT(fs->init());
+    return fs;
+}
+
+S3FileSystem::S3FileSystem(S3Conf s3_conf, std::string id)
+        : RemoteFileSystem(s3_conf.prefix, std::move(id), FileSystemType::S3),
+          _bucket(std::move(s3_conf.bucket)),
+          _prefix(std::move(s3_conf.prefix)),
+          _client(std::make_shared<ObjClientHolder>(std::move(s3_conf.client_conf))) {
+    // FIXME(plat1ko): Normalize prefix
+    // remove the first and last '/'
+    if (!_prefix.empty()) {
+        size_t start = _prefix.find_first_not_of('/');
+        if (start == std::string::npos) {
+            _prefix = "";
+        } else {
+            size_t end = _prefix.find_last_not_of('/');
+            if (start > 0 || end < _prefix.size() - 1) {
+                _prefix = _prefix.substr(start, end - start + 1);
+            }
+        }
+    }
+}
+
+Status S3FileSystem::init() {
+    return _client->init();
 }
 
 S3FileSystem::~S3FileSystem() = default;
 
-Status S3FileSystem::connect() {
-    if (bthread_self() == 0) {
-        return connect_impl();
-    }
-    Status s;
-    auto task = [&] { s = connect_impl(); };
-    AsyncIO::run_task(task, io::FileSystemType::S3);
-    return s;
-}
-
-Status S3FileSystem::connect_impl() {
-    std::lock_guard lock(_client_mu);
-    _client = ClientFactory::instance().create(_s3_conf);
-    if (!_client) {
-        return Status::InternalError("failed to init s3 client with {}", _s3_conf.to_string());
-    }
+Status S3FileSystem::create_file_impl(const Path& file, FileWriterPtr* writer,
+                                      const FileWriterOptions* opts) {
+    auto client = _client->get();
+    CHECK_S3_CLIENT(client);
+    auto key = DORIS_TRY(get_key(file));
+    *writer = std::make_unique<S3FileWriter>(_client, _bucket, std::move(key), opts);
     return Status::OK();
 }
 
-Status S3FileSystem::upload(const Path& local_path, const Path& dest_path) {
-    if (bthread_self() == 0) {
-        return upload_impl(local_path, dest_path);
-    }
-    Status s;
-    auto task = [&] { s = upload_impl(local_path, dest_path); };
-    AsyncIO::run_task(task, io::FileSystemType::S3);
-    return s;
+Status S3FileSystem::open_file_internal(const Path& file, FileReaderSPtr* reader,
+                                        const FileReaderOptions& opts) {
+    auto key = DORIS_TRY(get_key(file));
+    *reader = DORIS_TRY(S3FileReader::create(_client, _bucket, key, opts.file_size, nullptr));
+    return Status::OK();
 }
 
-Status S3FileSystem::upload_impl(const Path& local_path, const Path& dest_path) {
-    auto client = get_client();
+Status S3FileSystem::create_directory_impl(const Path& dir, bool failed_if_exists) {
+    return Status::OK();
+}
+
+Status S3FileSystem::delete_file_impl(const Path& file) {
+    auto client = _client->get();
     CHECK_S3_CLIENT(client);
 
-    Aws::Transfer::TransferManagerConfiguration transfer_config(_executor.get());
-    transfer_config.s3Client = client;
-    auto transfer_manager = Aws::Transfer::TransferManager::Create(transfer_config);
+    auto key = DORIS_TRY(get_key(file));
 
-    auto start = std::chrono::steady_clock::now();
+    auto resp = client->delete_object({.bucket = _bucket, .key = key});
 
-    auto key = get_key(dest_path);
-    auto handle = transfer_manager->UploadFile(local_path.native(), _s3_conf.bucket, key,
-                                               "text/plain", Aws::Map<Aws::String, Aws::String>());
-    handle->WaitUntilFinished();
-
-    auto duration = std::chrono::duration<float>(std::chrono::steady_clock::now() - start);
-
-    if (handle->GetStatus() != Aws::Transfer::TransferStatus::COMPLETED) {
-        return Status::IOError("failed to upload(endpoint={}, bucket={}, key={}): {}",
-                               _s3_conf.endpoint, _s3_conf.bucket, key,
-                               handle->GetLastError().GetMessage());
-    }
-
-    auto file_size = std::filesystem::file_size(local_path);
-    LOG(INFO) << "Upload " << local_path.native() << " to s3, endpoint=" << _s3_conf.endpoint
-              << ", bucket=" << _s3_conf.bucket << ", key=" << key
-              << ", duration=" << duration.count() << ", capacity=" << file_size
-              << ", tp=" << (file_size) / duration.count();
-
-    return Status::OK();
-}
-
-Status S3FileSystem::batch_upload(const std::vector<Path>& local_paths,
-                                  const std::vector<Path>& dest_paths) {
-    if (bthread_self() == 0) {
-        return batch_upload_impl(local_paths, dest_paths);
-    }
-    Status s;
-    auto task = [&] { s = batch_upload_impl(local_paths, dest_paths); };
-    AsyncIO::run_task(task, io::FileSystemType::S3);
-    return s;
-}
-
-Status S3FileSystem::batch_upload_impl(const std::vector<Path>& local_paths,
-                                       const std::vector<Path>& dest_paths) {
-    auto client = get_client();
-    CHECK_S3_CLIENT(client);
-
-    if (local_paths.size() != dest_paths.size()) {
-        return Status::InvalidArgument("local_paths.size() != dest_paths.size()");
-    }
-
-    Aws::Transfer::TransferManagerConfiguration transfer_config(_executor.get());
-    transfer_config.s3Client = client;
-    auto transfer_manager = Aws::Transfer::TransferManager::Create(transfer_config);
-
-    std::vector<std::shared_ptr<Aws::Transfer::TransferHandle>> handles;
-    for (int i = 0; i < local_paths.size(); ++i) {
-        auto key = get_key(dest_paths[i]);
-        LOG(INFO) << "Start to upload " << local_paths[i].native()
-                  << " to s3, endpoint=" << _s3_conf.endpoint << ", bucket=" << _s3_conf.bucket
-                  << ", key=" << key;
-        auto handle =
-                transfer_manager->UploadFile(local_paths[i].native(), _s3_conf.bucket, key,
-                                             "text/plain", Aws::Map<Aws::String, Aws::String>());
-        handles.push_back(std::move(handle));
-    }
-    for (auto& handle : handles) {
-        handle->WaitUntilFinished();
-        if (handle->GetStatus() != Aws::Transfer::TransferStatus::COMPLETED) {
-            // TODO(cyx): Maybe we can cancel remaining handles.
-            return Status::IOError(handle->GetLastError().GetMessage());
-        }
-    }
-    return Status::OK();
-}
-
-Status S3FileSystem::create_file(const Path& path, FileWriterPtr* writer) {
-    if (bthread_self() == 0) {
-        return create_file_impl(path, writer);
-    }
-    Status s;
-    auto task = [&] { s = create_file_impl(path, writer); };
-    AsyncIO::run_task(task, io::FileSystemType::S3);
-    return s;
-}
-
-Status S3FileSystem::create_file_impl(const Path& path, FileWriterPtr* writer) {
-    *writer = std::make_unique<S3FileWriter>(Path(get_key(path)), get_client(), _s3_conf);
-    return Status::OK();
-}
-
-Status S3FileSystem::open_file(const Path& path, FileReaderSPtr* reader, IOContext* io_ctx) {
-    if (bthread_self() == 0) {
-        return open_file_impl(path, reader, io_ctx);
-    }
-    Status s;
-    auto task = [&] { s = open_file_impl(path, reader, io_ctx); };
-    AsyncIO::run_task(task, io::FileSystemType::S3);
-    return s;
-}
-
-Status S3FileSystem::open_file_impl(const Path& path, FileReaderSPtr* reader,
-                                    IOContext* /*io_ctx*/) {
-    size_t fsize = 0;
-    RETURN_IF_ERROR(file_size(path, &fsize));
-    auto key = get_key(path);
-    auto fs_path = Path(_s3_conf.endpoint) / _s3_conf.bucket / key;
-    *reader = std::make_shared<S3FileReader>(
-            std::move(fs_path), fsize, std::move(key), _s3_conf.bucket,
-            std::static_pointer_cast<S3FileSystem>(shared_from_this()));
-    return Status::OK();
-}
-
-Status S3FileSystem::delete_file(const Path& path) {
-    if (bthread_self() == 0) {
-        return delete_file_impl(path);
-    }
-    Status s;
-    auto task = [&] { s = delete_file_impl(path); };
-    AsyncIO::run_task(task, io::FileSystemType::S3);
-    return s;
-}
-
-Status S3FileSystem::delete_file_impl(const Path& path) {
-    auto client = get_client();
-    CHECK_S3_CLIENT(client);
-
-    Aws::S3::Model::DeleteObjectRequest request;
-    auto key = get_key(path);
-    request.WithBucket(_s3_conf.bucket).WithKey(key);
-
-    auto outcome = client->DeleteObject(request);
-    if (outcome.IsSuccess() ||
-        outcome.GetError().GetResponseCode() == Aws::Http::HttpResponseCode::NOT_FOUND) {
+    if (resp.status.code == ErrorCode::OK || resp.status.code == ErrorCode::NOT_FOUND) {
         return Status::OK();
     }
-    return Status::IOError("failed to delete object(endpoint={}, bucket={}, key={}): {}",
-                           _s3_conf.endpoint, _s3_conf.bucket, key,
-                           outcome.GetError().GetMessage());
+    return std::move(Status(resp.status.code, std::move(resp.status.msg))
+                             .append(fmt::format("failed to delete file {}", full_s3_path(key))));
 }
 
-Status S3FileSystem::create_directory(const Path& path) {
-    return Status::OK();
-}
-
-Status S3FileSystem::delete_directory(const Path& path) {
-    if (bthread_self() == 0) {
-        return delete_directory_impl(path);
-    }
-    Status s;
-    auto task = [&] { s = delete_directory_impl(path); };
-    AsyncIO::run_task(task, io::FileSystemType::S3);
-    return s;
-}
-
-Status S3FileSystem::delete_directory_impl(const Path& path) {
-    auto client = get_client();
+Status S3FileSystem::delete_directory_impl(const Path& dir) {
+    auto client = _client->get();
     CHECK_S3_CLIENT(client);
 
-    Aws::S3::Model::ListObjectsV2Request request;
-    auto prefix = get_key(path);
+    auto prefix = DORIS_TRY(get_key(dir));
     if (!prefix.empty() && prefix.back() != '/') {
         prefix.push_back('/');
     }
-    request.WithBucket(_s3_conf.bucket).WithPrefix(prefix);
 
-    Aws::S3::Model::DeleteObjectsRequest delete_request;
-    delete_request.SetBucket(_s3_conf.bucket);
-    bool is_trucated = false;
-    do {
-        auto outcome = client->ListObjectsV2(request);
-        if (!outcome.IsSuccess()) {
-            return Status::IOError("failed to list objects(endpoint={}, bucket={}, prefix={}): {}",
-                                   _s3_conf.endpoint, _s3_conf.bucket, prefix,
-                                   outcome.GetError().GetMessage());
-        }
-        const auto& result = outcome.GetResult();
-        Aws::Vector<Aws::S3::Model::ObjectIdentifier> objects;
-        objects.reserve(result.GetContents().size());
-        for (const auto& obj : result.GetContents()) {
-            objects.emplace_back().SetKey(obj.GetKey());
-        }
-        if (!objects.empty()) {
-            Aws::S3::Model::Delete del;
-            del.WithObjects(std::move(objects)).SetQuiet(true);
-            delete_request.SetDelete(std::move(del));
-            auto delete_outcome = client->DeleteObjects(delete_request);
-            if (!delete_outcome.IsSuccess()) {
-                return Status::IOError(
-                        "failed to delete objects(endpoint={}, bucket={}, prefix={}): {}",
-                        _s3_conf.endpoint, _s3_conf.bucket, prefix,
-                        delete_outcome.GetError().GetMessage());
-            }
-            if (!delete_outcome.GetResult().GetErrors().empty()) {
-                const auto& e = delete_outcome.GetResult().GetErrors().front();
-                return Status::IOError("fail to delete object(endpoint={}, bucket={}, key={}): {}",
-                                       _s3_conf.endpoint, _s3_conf.bucket, e.GetKey(),
-                                       e.GetMessage());
-            }
-            VLOG_TRACE << "delete " << objects.size()
-                       << " s3 objects, endpoint: " << _s3_conf.endpoint
-                       << ", bucket: " << _s3_conf.bucket << ", prefix: " << _s3_conf.prefix;
-        }
-        is_trucated = result.GetIsTruncated();
-        request.SetContinuationToken(result.GetNextContinuationToken());
-    } while (is_trucated);
-    return Status::OK();
+    auto resp = client->delete_objects_recursively({
+            .path = full_s3_path(prefix),
+            .bucket = _bucket,
+            .prefix = prefix,
+    });
+    return {resp.status.code, std::move(resp.status.msg)};
 }
 
-Status S3FileSystem::link_file(const Path& src, const Path& dest) {
-    return Status::NotSupported("not support");
-}
-
-Status S3FileSystem::exists(const Path& path, bool* res) const {
-    if (bthread_self() == 0) {
-        return exists_impl(path, res);
-    }
-    Status s;
-    auto task = [&] { s = exists_impl(path, res); };
-    AsyncIO::run_task(task, io::FileSystemType::S3);
-    return s;
-}
-
-Status S3FileSystem::exists_impl(const Path& path, bool* res) const {
-    auto client = get_client();
-    CHECK_S3_CLIENT(client);
-
-    Aws::S3::Model::HeadObjectRequest request;
-    auto key = get_key(path);
-    request.WithBucket(_s3_conf.bucket).WithKey(key);
-
-    auto outcome = client->HeadObject(request);
-    if (outcome.IsSuccess()) {
-        *res = true;
-    } else if (outcome.GetError().GetResponseCode() == Aws::Http::HttpResponseCode::NOT_FOUND) {
-        *res = false;
-    } else {
-        return Status::IOError("failed to get object head(endpoint={}, bucket={}, key={}): {}",
-                               _s3_conf.endpoint, _s3_conf.bucket, key,
-                               outcome.GetError().GetMessage());
-    }
-    return Status::OK();
-}
-
-Status S3FileSystem::file_size(const Path& path, size_t* file_size) const {
-    if (bthread_self() == 0) {
-        return file_size_impl(path, file_size);
-    }
-    Status s;
-    auto task = [&] { s = file_size_impl(path, file_size); };
-    AsyncIO::run_task(task, io::FileSystemType::S3);
-    return s;
-}
-
-Status S3FileSystem::file_size_impl(const Path& path, size_t* file_size) const {
-    auto client = get_client();
-    CHECK_S3_CLIENT(client);
-
-    Aws::S3::Model::HeadObjectRequest request;
-    auto key = get_key(path);
-    request.WithBucket(_s3_conf.bucket).WithKey(key);
-
-    auto outcome = client->HeadObject(request);
-    if (outcome.IsSuccess()) {
-        *file_size = outcome.GetResult().GetContentLength();
-    } else {
-        return Status::IOError("failed to get object size(endpoint={}, bucket={}, key={}): {}",
-                               _s3_conf.endpoint, _s3_conf.bucket, key,
-                               outcome.GetError().GetMessage());
-    }
-    return Status::OK();
-}
-
-Status S3FileSystem::list(const Path& path, std::vector<Path>* files) {
-    auto client = get_client();
-    CHECK_S3_CLIENT(client);
-
-    Aws::S3::Model::ListObjectsV2Request request;
-    auto prefix = get_key(path);
-    if (!prefix.empty() && prefix.back() != '/') {
-        prefix.push_back('/');
-    }
-    request.WithBucket(_s3_conf.bucket).WithPrefix(prefix);
-    bool is_trucated = false;
-    do {
-        auto outcome = client->ListObjectsV2(request);
-        if (!outcome.IsSuccess()) {
-            return Status::IOError("failed to list objects(endpoint={}, bucket={}, prefix={}): {}",
-                                   _s3_conf.endpoint, _s3_conf.bucket, prefix,
-                                   outcome.GetError().GetMessage());
-        }
-        for (const auto& obj : outcome.GetResult().GetContents()) {
-            files->push_back(obj.GetKey().substr(prefix.size()));
-        }
-        is_trucated = outcome.GetResult().GetIsTruncated();
-        request.SetContinuationToken(outcome.GetResult().GetNextContinuationToken());
-    } while (is_trucated);
-    return Status::OK();
-}
-
-Status S3FileSystem::batch_delete(const std::vector<Path>& paths) {
-    auto client = get_client();
+Status S3FileSystem::batch_delete_impl(const std::vector<Path>& remote_files) {
+    auto client = _client->get();
     CHECK_S3_CLIENT(client);
 
     // `DeleteObjectsRequest` can only contain 1000 keys at most.
     constexpr size_t max_delete_batch = 1000;
-    auto path_iter = paths.begin();
+    auto path_iter = remote_files.begin();
 
-    Aws::S3::Model::DeleteObjectsRequest delete_request;
-    delete_request.SetBucket(_s3_conf.bucket);
     do {
-        Aws::S3::Model::Delete del;
-        Aws::Vector<Aws::S3::Model::ObjectIdentifier> objects;
+        std::vector<std::string> objects;
         auto path_begin = path_iter;
-        for (; path_iter != paths.end() && (path_iter - path_begin < max_delete_batch);
+        for (; path_iter != remote_files.end() && (path_iter - path_begin < max_delete_batch);
              ++path_iter) {
-            objects.emplace_back().SetKey(get_key(*path_iter));
+            auto key = DORIS_TRY(get_key(*path_iter));
+            objects.emplace_back(std::move(key));
         }
         if (objects.empty()) {
             return Status::OK();
         }
-        del.WithObjects(std::move(objects)).SetQuiet(true);
-        delete_request.SetDelete(std::move(del));
-        auto delete_outcome = client->DeleteObjects(delete_request);
-        if (UNLIKELY(!delete_outcome.IsSuccess())) {
-            return Status::IOError(
-                    "failed to delete objects(endpoint={}, bucket={}, key[0]={}): {}",
-                    _s3_conf.endpoint, _s3_conf.bucket, objects.front().GetKey(),
-                    delete_outcome.GetError().GetMessage());
+        // clang-format off
+        if (auto resp = client->delete_objects( {.bucket = _bucket,}, std::move(objects)); resp.status.code != ErrorCode::OK) {
+            return {resp.status.code, std::move(resp.status.msg)};
         }
-        if (UNLIKELY(!delete_outcome.GetResult().GetErrors().empty())) {
-            const auto& e = delete_outcome.GetResult().GetErrors().front();
-            return Status::IOError("failed to delete objects(endpoint={}, bucket={}, key={}): {}",
-                                   _s3_conf.endpoint, _s3_conf.bucket, e.GetKey(),
-                                   delete_outcome.GetError().GetMessage());
-        }
-    } while (path_iter != paths.end());
+        // clang-format on
+    } while (path_iter != remote_files.end());
 
     return Status::OK();
 }
 
-std::string S3FileSystem::get_key(const Path& path) const {
-    StringPiece str(path.native());
-    if (str.starts_with(_root_path.native())) {
-        return fmt::format("{}/{}", _s3_conf.prefix, str.data() + _root_path.native().size());
+Status S3FileSystem::exists_impl(const Path& path, bool* res) const {
+    auto client = _client->get();
+    CHECK_S3_CLIENT(client);
+    auto key = DORIS_TRY(get_key(path));
+
+    auto resp = client->head_object({.bucket = _bucket, .key = key});
+
+    if (resp.resp.status.code == ErrorCode::OK) {
+        *res = true;
+    } else if (resp.resp.status.code == ErrorCode::NOT_FOUND) {
+        *res = false;
+    } else {
+        return std::move(
+                Status(resp.resp.status.code, std::move(resp.resp.status.msg))
+                        .append(fmt::format(" failed to check exists {}", full_s3_path(key))));
     }
-    // We consider it as a relative path.
-    return fmt::format("{}/{}", _s3_conf.prefix, path.native());
+    return Status::OK();
 }
 
-} // namespace io
-} // namespace doris
+Status S3FileSystem::file_size_impl(const Path& file, int64_t* file_size) const {
+    auto key = DORIS_TRY(get_key(file));
+    *file_size = DORIS_TRY(_client->object_file_size(_bucket, key));
+    return Status::OK();
+}
+
+Status S3FileSystem::list_impl(const Path& dir, bool only_file, std::vector<FileInfo>* files,
+                               bool* exists) {
+    // For object storage, this path is always not exist.
+    // So we ignore this property and set exists to true.
+    *exists = true;
+    auto client = _client->get();
+    CHECK_S3_CLIENT(client);
+    auto prefix = DORIS_TRY(get_key(dir));
+    if (!prefix.empty() && prefix.back() != '/') {
+        prefix.push_back('/');
+    }
+
+    // clang-format off
+    auto resp = client->list_objects( {.bucket = _bucket, .prefix = prefix,}, files);
+    // clang-format on
+    if (resp.status.code == ErrorCode::OK) {
+        for (auto&& file : *files) {
+            file.file_name.erase(0, prefix.size());
+        }
+    }
+
+    return {resp.status.code, std::move(resp.status.msg)};
+}
+
+Status S3FileSystem::rename_impl(const Path& orig_name, const Path& new_name) {
+    return Status::NotSupported("S3FileSystem::rename_impl");
+}
+
+Status S3FileSystem::upload_impl(const Path& local_file, const Path& remote_file) {
+    auto client = _client->get();
+    CHECK_S3_CLIENT(client);
+
+    auto key = DORIS_TRY(get_key(remote_file));
+    auto start = std::chrono::steady_clock::now();
+    FileWriterPtr obj_writer;
+    RETURN_IF_ERROR(create_file_impl(key, &obj_writer, nullptr));
+    FileReaderSPtr local_reader;
+    RETURN_IF_ERROR(io::global_local_filesystem()->open_file(local_file, &local_reader));
+    size_t local_buffer_size = config::s3_file_system_local_upload_buffer_size;
+    std::unique_ptr<char[]> write_buffer =
+            std::make_unique_for_overwrite<char[]>(local_buffer_size);
+    size_t cur_read = 0;
+    while (cur_read < local_reader->size()) {
+        size_t bytes_read = 0;
+        RETURN_IF_ERROR(local_reader->read_at(
+                cur_read, Slice {write_buffer.get(), local_buffer_size}, &bytes_read));
+        RETURN_IF_ERROR(obj_writer->append({write_buffer.get(), bytes_read}));
+        cur_read += bytes_read;
+    }
+    RETURN_IF_ERROR(obj_writer->close());
+    auto duration = std::chrono::duration<float>(std::chrono::steady_clock::now() - start);
+
+    auto size = local_reader->size();
+    LOG(INFO) << "Upload " << local_file.native() << " to " << full_s3_path(key)
+              << ", duration=" << duration.count() << ", bytes=" << size;
+
+    return Status::OK();
+}
+
+Status S3FileSystem::batch_upload_impl(const std::vector<Path>& local_files,
+                                       const std::vector<Path>& remote_files) {
+    auto client = _client->get();
+    CHECK_S3_CLIENT(client);
+
+    if (local_files.size() != remote_files.size()) {
+        return Status::InvalidArgument("local_files.size({}) != remote_files.size({})",
+                                       local_files.size(), remote_files.size());
+    }
+
+    std::vector<FileWriterPtr> obj_writers(local_files.size());
+
+    auto upload_task = [&, this](size_t idx) {
+        const auto& local_file = local_files[idx];
+        const auto& remote_file = remote_files[idx];
+        auto& obj_writer = obj_writers[idx];
+        auto key = DORIS_TRY(get_key(remote_file));
+        LOG(INFO) << "Start to upload " << local_file.native() << " to " << full_s3_path(key);
+        RETURN_IF_ERROR(create_file_impl(key, &obj_writer, nullptr));
+        FileReaderSPtr local_reader;
+        RETURN_IF_ERROR(io::global_local_filesystem()->open_file(local_file, &local_reader));
+        size_t local_buffer_size = config::s3_file_system_local_upload_buffer_size;
+        std::unique_ptr<char[]> write_buffer =
+                std::make_unique_for_overwrite<char[]>(local_buffer_size);
+        size_t cur_read = 0;
+        while (cur_read < local_reader->size()) {
+            size_t bytes_read = 0;
+            RETURN_IF_ERROR(local_reader->read_at(
+                    cur_read, Slice {write_buffer.get(), local_buffer_size}, &bytes_read));
+            RETURN_IF_ERROR((*obj_writer).append({write_buffer.get(), bytes_read}));
+            cur_read += bytes_read;
+        }
+        RETURN_IF_ERROR((*obj_writer).close());
+        return Status::OK();
+    };
+
+    Status s = Status::OK();
+    std::vector<std::future<Status>> futures;
+    for (int i = 0; i < local_files.size(); ++i) {
+        auto task = std::make_shared<std::packaged_task<Status(size_t idx)>>(upload_task);
+        futures.emplace_back(task->get_future());
+        auto st = ExecEnv::GetInstance()->s3_file_system_thread_pool()->submit_func(
+                [t = std::move(task), idx = i]() mutable { (*t)(idx); });
+        // We shouldn't return immediately since the previous submitted tasks might still be running in the thread pool
+        if (!st.ok()) {
+            s = st;
+            break;
+        }
+    }
+    for (auto&& f : futures) {
+        auto cur_s = f.get();
+        if (!cur_s.ok()) {
+            s = std::move(cur_s);
+        }
+    }
+    return s;
+}
+
+Status S3FileSystem::download_impl(const Path& remote_file, const Path& local_file) {
+    auto client = _client->get();
+    CHECK_S3_CLIENT(client);
+    auto key = DORIS_TRY(get_key(remote_file));
+    int64_t size;
+    RETURN_IF_ERROR(file_size(remote_file, &size));
+    std::unique_ptr<char[]> buf = std::make_unique_for_overwrite<char[]>(size);
+    size_t bytes_read = 0;
+    // clang-format off
+    auto resp = client->get_object( {.bucket = _bucket, .key = key,},
+            buf.get(), 0, size, &bytes_read);
+    // clang-format on
+    if (resp.status.code != ErrorCode::OK) {
+        return {resp.status.code, std::move(resp.status.msg)};
+    }
+    Aws::OFStream local_file_s;
+    local_file_s.open(local_file, std::ios::out | std::ios::binary);
+    if (local_file_s.good()) {
+        local_file_s << StringViewStream(buf.get(), size).rdbuf();
+    } else {
+        return localfs_error(errno, fmt::format("failed to write file {}", local_file.native()));
+    }
+
+    return Status::OK();
+}
+
+// oss has public endpoint and private endpoint, is_public_endpoint determines
+// whether to return a public endpoint.
+std::string S3FileSystem::generate_presigned_url(const Path& path, int64_t expiration_secs,
+                                                 bool is_public_endpoint) const {
+    std::string key = fmt::format("{}/{}", _prefix, path.native());
+    std::shared_ptr<ObjStorageClient> client;
+    if (is_public_endpoint &&
+        _client->s3_client_conf().endpoint.ends_with(OSS_PRIVATE_ENDPOINT_SUFFIX)) {
+        auto new_s3_conf = _client->s3_client_conf();
+        new_s3_conf.endpoint.erase(
+                _client->s3_client_conf().endpoint.size() - OSS_PRIVATE_ENDPOINT_SUFFIX.size(),
+                LEN_OF_OSS_PRIVATE_SUFFIX);
+        client = S3ClientFactory::instance().create(new_s3_conf);
+    } else {
+        client = _client->get();
+    }
+    return client->generate_presigned_url({.bucket = _bucket, .key = key}, expiration_secs,
+                                          _client->s3_client_conf());
+}
+
+} // namespace doris::io

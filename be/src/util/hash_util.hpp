@@ -20,25 +20,18 @@
 
 #pragma once
 
-#include <functional>
-
-#include "common/compiler_util.h"
-
-// For cross compiling with clang, we need to be able to generate an IR file with
-// no sse instructions.  Attempting to load a precompiled IR file that contains
-// unsupported instructions causes llvm to fail.  We need to use #defines to control
-// the code that is built and the runtime checks to control what code is run.
-#ifdef __SSE4_2__
-#include <nmmintrin.h>
-#elif __aarch64__
-#include <sse2neon.h>
-#endif
+#include <gen_cpp/Types_types.h>
 #include <xxh3.h>
 #include <zlib.h>
 
-#include "gen_cpp/Types_types.h"
+#include <functional>
+
+#include "common/compiler_util.h" // IWYU pragma: keep
+#include "gutil/hash/city.h"
+#include "runtime/define_primitive_type.h"
 #include "util/cpu_info.h"
 #include "util/murmur_hash3.h"
+#include "util/sse_util.hpp"
 
 namespace doris {
 
@@ -48,7 +41,7 @@ public:
     template <typename T>
     static uint32_t fixed_len_to_uint32(T value) {
         if constexpr (sizeof(T) <= sizeof(uint32_t)) {
-            return value;
+            return (uint32_t)value;
         }
         return std::hash<T>()(value);
     }
@@ -336,8 +329,22 @@ public:
         seed ^= hasher(v) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
     }
 
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wused-but-marked-unused"
+#endif
     // xxHash function for a byte array.  For convenience, a 64-bit seed is also
     // hashed into the result.  The mapping may change from time to time.
+    static xxh_u32 xxHash32WithSeed(const char* s, size_t len, xxh_u32 seed) {
+        return XXH32(s, len, seed);
+    }
+
+    // same to the up function, just for null value
+    static xxh_u32 xxHash32NullWithSeed(xxh_u32 seed) {
+        static const int INT_VALUE = 0;
+        return XXH32(reinterpret_cast<const char*>(&INT_VALUE), sizeof(int), seed);
+    }
+
     static xxh_u64 xxHash64WithSeed(const char* s, size_t len, xxh_u64 seed) {
         return XXH3_64bits_withSeed(s, len, seed);
     }
@@ -347,6 +354,10 @@ public:
         static const int INT_VALUE = 0;
         return XXH3_64bits_withSeed(reinterpret_cast<const char*>(&INT_VALUE), sizeof(int), seed);
     }
+
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 };
 
 } // namespace doris
@@ -371,16 +382,6 @@ struct std::hash<doris::TNetworkAddress> {
     }
 };
 
-#if __GNUC__ < 6 && !defined(__clang__)
-// Cause this is builtin function
-template <>
-struct std::hash<__int128> {
-    std::size_t operator()(const __int128& val) const {
-        return doris::HashUtil::hash(&val, sizeof(val), 0);
-    }
-};
-#endif
-
 template <>
 struct std::hash<std::pair<doris::TUniqueId, int64_t>> {
     size_t operator()(const std::pair<doris::TUniqueId, int64_t>& pair) const {
@@ -389,5 +390,14 @@ struct std::hash<std::pair<doris::TUniqueId, int64_t>> {
         seed = doris::HashUtil::hash(&pair.first.hi, sizeof(pair.first.hi), seed);
         seed = doris::HashUtil::hash(&pair.second, sizeof(pair.second), seed);
         return seed;
+    }
+};
+
+template <class First, class Second>
+struct std::hash<std::pair<First, Second>> {
+    size_t operator()(const pair<First, Second>& p) const {
+        size_t h1 = std::hash<First>()(p.first);
+        size_t h2 = std::hash<Second>()(p.second);
+        return util_hash::HashLen16(h1, h2);
     }
 };

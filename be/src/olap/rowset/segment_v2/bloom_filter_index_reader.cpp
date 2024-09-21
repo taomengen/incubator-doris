@@ -17,14 +17,28 @@
 
 #include "olap/rowset/segment_v2/bloom_filter_index_reader.h"
 
+#include <gen_cpp/segment_v2.pb.h>
+#include <glog/logging.h>
+
 #include "olap/rowset/segment_v2/bloom_filter.h"
 #include "olap/types.h"
+#include "util/debug_points.h"
+#include "vec/columns/column.h"
+#include "vec/common/string_ref.h"
+#include "vec/data_types/data_type.h"
 #include "vec/data_types/data_type_factory.hpp"
 
 namespace doris {
 namespace segment_v2 {
 
 Status BloomFilterIndexReader::load(bool use_page_cache, bool kept_in_memory) {
+    // TODO yyq: implement a new once flag to avoid status construct.
+    return _load_once.call([this, use_page_cache, kept_in_memory] {
+        return _load(use_page_cache, kept_in_memory);
+    });
+}
+
+Status BloomFilterIndexReader::_load(bool use_page_cache, bool kept_in_memory) {
     const IndexedColumnMetaPB& bf_index_meta = _bloom_filter_index_meta->bloom_filter();
 
     _bloom_filter_reader.reset(new IndexedColumnReader(_file_reader, bf_index_meta));
@@ -33,6 +47,9 @@ Status BloomFilterIndexReader::load(bool use_page_cache, bool kept_in_memory) {
 }
 
 Status BloomFilterIndexReader::new_iterator(std::unique_ptr<BloomFilterIndexIterator>* iterator) {
+    DBUG_EXECUTE_IF("BloomFilterIndexReader::new_iterator.fail", {
+        return Status::InternalError("new_iterator for bloom filter index failed");
+    });
     iterator->reset(new BloomFilterIndexIterator(this));
     return Status::OK();
 }
@@ -50,10 +67,10 @@ Status BloomFilterIndexIterator::read_bloom_filter(rowid_t ordinal,
     DCHECK(num_to_read == num_read);
     // construct bloom filter
     StringRef value = column->get_data_at(0);
-    BloomFilter::create(_reader->_bloom_filter_index_meta->algorithm(), bf, value.size);
+    RETURN_IF_ERROR(
+            BloomFilter::create(_reader->_bloom_filter_index_meta->algorithm(), bf, value.size));
     RETURN_IF_ERROR((*bf)->init(value.data, value.size,
                                 _reader->_bloom_filter_index_meta->hash_strategy()));
-    _pool->clear();
     return Status::OK();
 }
 

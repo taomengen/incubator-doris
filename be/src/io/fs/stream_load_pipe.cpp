@@ -17,12 +17,22 @@
 
 #include "stream_load_pipe.h"
 
-#include "olap/iterators.h"
+#include <glog/logging.h>
+
+#include <algorithm>
+#include <ostream>
+#include <utility>
+
+#include "common/compiler_util.h" // IWYU pragma: keep
+#include "common/status.h"
+#include "runtime/exec_env.h"
 #include "runtime/thread_context.h"
 #include "util/bit_util.h"
 
 namespace doris {
 namespace io {
+struct IOContext;
+
 StreamLoadPipe::StreamLoadPipe(size_t max_buffered_bytes, size_t min_chunk_size,
                                int64_t total_length, bool use_proto)
         : _buffered_bytes(0),
@@ -33,15 +43,13 @@ StreamLoadPipe::StreamLoadPipe(size_t max_buffered_bytes, size_t min_chunk_size,
           _use_proto(use_proto) {}
 
 StreamLoadPipe::~StreamLoadPipe() {
-    SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(ExecEnv::GetInstance()->orphan_mem_tracker());
     while (!_buf_queue.empty()) {
         _buf_queue.pop_front();
     }
 }
 
-Status StreamLoadPipe::read_at(size_t /*offset*/, Slice result, const IOContext& /*io_ctx*/,
-                               size_t* bytes_read) {
-    SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(ExecEnv::GetInstance()->orphan_mem_tracker());
+Status StreamLoadPipe::read_at_impl(size_t /*offset*/, Slice result, size_t* bytes_read,
+                                    const IOContext* /*io_ctx*/) {
     *bytes_read = 0;
     size_t bytes_req = result.size;
     char* to = result.data;
@@ -55,7 +63,7 @@ Status StreamLoadPipe::read_at(size_t /*offset*/, Slice result, const IOContext&
         }
         // cancelled
         if (_cancelled) {
-            return Status::InternalError("cancelled: {}", _cancelled_reason);
+            return Status::Cancelled("cancelled: {}", _cancelled_reason);
         }
         // finished
         if (_buf_queue.empty()) {
@@ -79,7 +87,7 @@ Status StreamLoadPipe::read_at(size_t /*offset*/, Slice result, const IOContext&
     return Status::OK();
 }
 
-// If _total_length == -1, this should be a Kafka routine load task,
+// If _total_length == -1, this should be a Kafka routine load task or stream load with chunked transfer HTTP request,
 // just get the next buffer directly from the buffer queue, because one buffer contains a complete piece of data.
 // Otherwise, this should be a stream load task that needs to read the specified amount of data.
 Status StreamLoadPipe::read_one_message(std::unique_ptr<uint8_t[]>* data, size_t* length) {
@@ -98,13 +106,14 @@ Status StreamLoadPipe::read_one_message(std::unique_ptr<uint8_t[]>* data, size_t
     // _total_length > 0, read the entire data
     data->reset(new uint8_t[_total_length]);
     Slice result(data->get(), _total_length);
-    IOContext io_ctx;
-    Status st = read_at(0, result, io_ctx, length);
+    Status st = read_at(0, result, length);
     return st;
 }
 
 Status StreamLoadPipe::append_and_flush(const char* data, size_t size, size_t proto_byte_size) {
-    ByteBufferPtr buf = ByteBuffer::allocate(BitUtil::RoundUpToPowerOfTwo(size + 1));
+    SCOPED_ATTACH_TASK(ExecEnv::GetInstance()->stream_load_pipe_tracker());
+    ByteBufferPtr buf;
+    RETURN_IF_ERROR(ByteBuffer::allocate(BitUtil::RoundUpToPowerOfTwo(size + 1), &buf));
     buf->put_bytes(data, size);
     buf->flip();
     return _append(buf, proto_byte_size);
@@ -138,7 +147,8 @@ Status StreamLoadPipe::append(const char* data, size_t size) {
     // need to allocate a new chunk, min chunk is 64k
     size_t chunk_size = std::max(_min_chunk_size, size - pos);
     chunk_size = BitUtil::RoundUpToPowerOfTwo(chunk_size);
-    _write_buf = ByteBuffer::allocate(chunk_size);
+    SCOPED_ATTACH_TASK(ExecEnv::GetInstance()->stream_load_pipe_tracker());
+    RETURN_IF_ERROR(ByteBuffer::allocate(chunk_size, &_write_buf));
     _write_buf->put_bytes(data + pos, size - pos);
     return Status::OK();
 }
@@ -160,7 +170,7 @@ Status StreamLoadPipe::_read_next_buffer(std::unique_ptr<uint8_t[]>* data, size_
     }
     // cancelled
     if (_cancelled) {
-        return Status::InternalError("cancelled: {}", _cancelled_reason);
+        return Status::Cancelled("cancelled: {}", _cancelled_reason);
     }
     // finished
     if (_buf_queue.empty()) {
@@ -202,7 +212,7 @@ Status StreamLoadPipe::_append(const ByteBufferPtr& buf, size_t proto_byte_size)
             }
         }
         if (_cancelled) {
-            return Status::InternalError("cancelled: {}", _cancelled_reason);
+            return Status::Cancelled("cancelled: {}", _cancelled_reason);
         }
         _buf_queue.push_back(buf);
         if (_use_proto) {
@@ -219,7 +229,7 @@ Status StreamLoadPipe::_append(const ByteBufferPtr& buf, size_t proto_byte_size)
 Status StreamLoadPipe::finish() {
     if (_write_buf != nullptr) {
         _write_buf->flip();
-        _append(_write_buf);
+        RETURN_IF_ERROR(_append(_write_buf));
         _write_buf.reset();
     }
     {
@@ -239,6 +249,22 @@ void StreamLoadPipe::cancel(const std::string& reason) {
     }
     _get_cond.notify_all();
     _put_cond.notify_all();
+}
+
+TUniqueId StreamLoadPipe::calculate_pipe_id(const UniqueId& query_id, int32_t fragment_id) {
+    TUniqueId pipe_id;
+    pipe_id.lo = query_id.lo + fragment_id;
+    pipe_id.hi = query_id.hi;
+    return pipe_id;
+}
+
+size_t StreamLoadPipe::current_capacity() {
+    std::unique_lock<std::mutex> l(_lock);
+    if (_use_proto) {
+        return _proto_buffered_bytes;
+    } else {
+        return _buffered_bytes;
+    }
 }
 
 } // namespace io

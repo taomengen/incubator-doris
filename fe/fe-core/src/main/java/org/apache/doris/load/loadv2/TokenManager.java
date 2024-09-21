@@ -20,6 +20,7 @@ package org.apache.doris.load.loadv2;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.ClientPool;
 import org.apache.doris.common.Config;
+import org.apache.doris.common.CustomThreadFactory;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.UserException;
 import org.apache.doris.thrift.FrontendService;
@@ -41,32 +42,36 @@ import java.util.concurrent.TimeUnit;
 public class TokenManager {
     private static final Logger LOG = LogManager.getLogger(TokenManager.class);
 
-    private final int thriftTimeoutMs = 300 * 1000;
-    private final EvictingQueue<String> tokenQueue;
-    private final ScheduledExecutorService tokenGenerator;
+    private  int thriftTimeoutMs = 300 * 1000;
+    private  EvictingQueue<String> tokenQueue;
+    private  String latestToken;
+    private  ScheduledExecutorService tokenGenerator;
 
     public TokenManager() {
+    }
+
+    public void start() {
         this.tokenQueue = EvictingQueue.create(Config.token_queue_size);
         // init one token to avoid async issue.
-        this.tokenQueue.offer(generateNewToken());
-        this.tokenGenerator = Executors.newScheduledThreadPool(1);
-        this.tokenGenerator.scheduleAtFixedRate(() -> {
-            tokenQueue.offer(generateNewToken());
-        }, 0, Config.token_generate_period_hour, TimeUnit.HOURS);
+        this.addNewToken(generateNewToken());
+        this.tokenGenerator = Executors.newScheduledThreadPool(1,
+                new CustomThreadFactory("token-generator"));
+        this.tokenGenerator.scheduleAtFixedRate(() -> this.addNewToken(generateNewToken()), 0,
+                Config.token_generate_period_hour, TimeUnit.HOURS);
+    }
+
+    private void addNewToken(String token) {
+        tokenQueue.offer(token);
+        latestToken = token;
     }
 
     private String generateNewToken() {
         return UUID.randomUUID().toString();
     }
 
-    // this method only will be called in master node, since stream load only send message to master.
-    public boolean checkAuthToken(String token) {
-        return tokenQueue.contains(token);
-    }
-
     public String acquireToken() throws UserException {
         if (Env.getCurrentEnv().isMaster() || FeConstants.runningUnitTest) {
-            return tokenQueue.peek();
+            return latestToken;
         } else {
             try {
                 return acquireTokenFromMaster();
@@ -77,12 +82,13 @@ public class TokenManager {
         }
     }
 
-    public String acquireTokenFromMaster() throws TException {
+    private String acquireTokenFromMaster() throws TException {
         TNetworkAddress thriftAddress = getMasterAddress();
-
         FrontendService.Client client = getClient(thriftAddress);
 
-        LOG.debug("Send acquire token to Master {}", thriftAddress);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Send acquire token to Master {}", thriftAddress);
+        }
 
         boolean isReturnToPool = false;
         try {
@@ -102,7 +108,7 @@ public class TokenManager {
             } else {
                 TMySqlLoadAcquireTokenResult result = client.acquireToken();
                 if (result.getStatus().getStatusCode() != TStatusCode.OK) {
-                    throw new TException("commit failed.");
+                    throw new TException("acquire token from master failed. " + result.getStatus());
                 }
                 isReturnToPool = true;
                 return result.getToken();
@@ -116,9 +122,61 @@ public class TokenManager {
         }
     }
 
+    /**
+     * Check if the token is valid.
+     * If this is not Master FE, will send the request to Master FE.
+     */
+    public boolean checkAuthToken(String token) throws UserException {
+        if (Env.getCurrentEnv().isMaster() || FeConstants.runningUnitTest) {
+            return tokenQueue.contains(token);
+        } else {
+            try {
+                return checkTokenFromMaster(token);
+            } catch (TException e) {
+                LOG.warn("check token error", e);
+                throw new UserException("Check token from master failed", e);
+            }
+        }
+    }
 
-    private TNetworkAddress getMasterAddress() {
-        String masterHost = Env.getCurrentEnv().getMasterIp();
+    private boolean checkTokenFromMaster(String token) throws TException {
+        TNetworkAddress thriftAddress = getMasterAddress();
+        FrontendService.Client client = getClient(thriftAddress);
+
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Send check token to Master {}", thriftAddress);
+        }
+
+        boolean isReturnToPool = false;
+        try {
+            boolean result = client.checkToken(token);
+            isReturnToPool = true;
+            return result;
+        } catch (TTransportException e) {
+            boolean ok = ClientPool.frontendPool.reopen(client, thriftTimeoutMs);
+            if (!ok) {
+                throw e;
+            }
+            if (e.getType() == TTransportException.TIMED_OUT) {
+                throw e;
+            } else {
+                boolean result = client.checkToken(token);
+                isReturnToPool = true;
+                return result;
+            }
+        } finally {
+            if (isReturnToPool) {
+                ClientPool.frontendPool.returnObject(thriftAddress, client);
+            } else {
+                ClientPool.frontendPool.invalidateObject(thriftAddress, client);
+            }
+        }
+    }
+
+
+    private TNetworkAddress getMasterAddress() throws TException {
+        Env.getCurrentEnv().checkReadyOrThrowTException();
+        String masterHost = Env.getCurrentEnv().getMasterHost();
         int masterRpcPort = Env.getCurrentEnv().getMasterRpcPort();
         return new TNetworkAddress(masterHost, masterRpcPort);
     }

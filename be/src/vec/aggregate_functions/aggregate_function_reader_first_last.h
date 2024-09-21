@@ -20,14 +20,18 @@
 #include "factory_helpers.h"
 #include "vec/aggregate_functions/aggregate_function.h"
 #include "vec/aggregate_functions/helpers.h"
+#include "vec/columns/column_array.h"
+#include "vec/columns/column_map.h"
 #include "vec/columns/column_nullable.h"
+#include "vec/columns/column_object.h"
+#include "vec/columns/column_struct.h"
 #include "vec/columns/column_vector.h"
 #include "vec/data_types/data_type_decimal.h"
 #include "vec/data_types/data_type_nullable.h"
 #include "vec/data_types/data_type_number.h"
 #include "vec/data_types/data_type_string.h"
+#include "vec/functions/function.h"
 #include "vec/io/io_helper.h"
-#include "vec/utils/template_helpers.hpp"
 
 namespace doris::vectorized {
 
@@ -39,17 +43,19 @@ public:
             return true;
         }
         if constexpr (arg_is_nullable) {
-            return assert_cast<const ColumnNullable*>(_ptr)->is_null_at(_offset);
+            return assert_cast<const ColumnNullable*, TypeCheckOnRelease::DISABLE>(_ptr)
+                    ->is_null_at(_offset);
         }
         return false;
     }
 
-    StringRef get_value() const {
+    void insert_into(IColumn& to) const {
         if constexpr (arg_is_nullable) {
-            auto* col = assert_cast<const ColumnNullable*>(_ptr);
-            return assert_cast<const ColVecType&>(col->get_nested_column()).get_data_at(_offset);
+            auto* col = assert_cast<const ColumnNullable*, TypeCheckOnRelease::DISABLE>(_ptr);
+            assert_cast<ColVecType&, TypeCheckOnRelease::DISABLE>(to).insert_from(
+                    col->get_nested_column(), _offset);
         } else {
-            return assert_cast<const ColVecType*>(_ptr)->get_data_at(_offset);
+            assert_cast<ColVecType&, TypeCheckOnRelease::DISABLE>(to).insert_from(*_ptr, _offset);
         }
     }
 
@@ -71,7 +77,9 @@ protected:
 template <typename ColVecType, bool arg_is_nullable>
 struct CopiedValue : public Value<ColVecType, arg_is_nullable> {
 public:
-    StringRef get_value() const { return _copied_value; }
+    void insert_into(IColumn& to) const {
+        assert_cast<ColVecType&, TypeCheckOnRelease::DISABLE>(to).insert(_copied_value);
+    }
 
     bool is_null() const { return this->_ptr == nullptr; }
 
@@ -81,22 +89,22 @@ public:
         // because the address have meaningless, only need it to check is nullptr
         this->_ptr = (IColumn*)0x00000001;
         if constexpr (arg_is_nullable) {
-            auto* col = assert_cast<const ColumnNullable*>(column);
+            auto* col = assert_cast<const ColumnNullable*, TypeCheckOnRelease::DISABLE>(column);
             if (col->is_null_at(row)) {
                 this->reset();
                 return;
             } else {
-                _copied_value = assert_cast<const ColVecType&>(col->get_nested_column())
-                                        .get_data_at(row)
-                                        .to_string();
+                auto& nested_col = assert_cast<const ColVecType&, TypeCheckOnRelease::DISABLE>(
+                        col->get_nested_column());
+                nested_col.get(row, _copied_value);
             }
         } else {
-            _copied_value = assert_cast<const ColVecType*>(column)->get_data_at(row).to_string();
+            column->get(row, _copied_value);
         }
     }
 
 private:
-    std::string _copied_value;
+    Field _copied_value;
 };
 
 template <typename ColVecType, bool result_is_nullable, bool arg_is_nullable, bool is_copy>
@@ -105,6 +113,7 @@ public:
     using StoreType = std::conditional_t<is_copy, CopiedValue<ColVecType, arg_is_nullable>,
                                          Value<ColVecType, arg_is_nullable>>;
     static constexpr bool nullable = arg_is_nullable;
+    static constexpr bool result_nullable = result_is_nullable;
 
     void reset() {
         _data_value.reset();
@@ -118,15 +127,11 @@ public:
                 col.insert_default();
             } else {
                 auto& col = assert_cast<ColumnNullable&>(to);
-                //get_value will never get null value
-                const StringRef& value = _data_value.get_value();
                 col.get_null_map_data().push_back(0);
-                assert_cast<ColVecType&>(col.get_nested_column())
-                        .insert_data(value.data, value.size);
+                _data_value.insert_into(col.get_nested_column());
             }
         } else {
-            const StringRef& value = _data_value.get_value();
-            assert_cast<ColVecType&>(to).insert_data(value.data, value.size);
+            _data_value.insert_into(to);
         }
     }
 
@@ -162,7 +167,8 @@ struct ReaderFunctionFirstNonNullData : Data {
             return;
         }
         if constexpr (Data::nullable) {
-            const auto* nullable_column = assert_cast<const ColumnNullable*>(columns[0]);
+            const auto* nullable_column =
+                    assert_cast<const ColumnNullable*, TypeCheckOnRelease::DISABLE>(columns[0]);
             if (nullable_column->is_null_at(row)) {
                 return;
             }
@@ -182,7 +188,8 @@ template <typename Data>
 struct ReaderFunctionLastNonNullData : Data {
     void add(int64_t row, const IColumn** columns) {
         if constexpr (Data::nullable) {
-            const auto* nullable_column = assert_cast<const ColumnNullable*>(columns[0]);
+            const auto* nullable_column =
+                    assert_cast<const ColumnNullable*, TypeCheckOnRelease::DISABLE>(columns[0]);
             if (nullable_column->is_null_at(row)) {
                 return;
             }
@@ -197,19 +204,25 @@ template <typename Data>
 class ReaderFunctionData final
         : public IAggregateFunctionDataHelper<Data, ReaderFunctionData<Data>> {
 public:
-    ReaderFunctionData(const DataTypes& argument_types)
-            : IAggregateFunctionDataHelper<Data, ReaderFunctionData<Data>>(argument_types),
-              _argument_type(argument_types[0]) {}
+    ReaderFunctionData(const DataTypes& argument_types_)
+            : IAggregateFunctionDataHelper<Data, ReaderFunctionData<Data>>(argument_types_),
+              _argument_type(argument_types_[0]) {}
 
     String get_name() const override { return Data::name(); }
 
-    DataTypePtr get_return_type() const override { return _argument_type; }
+    DataTypePtr get_return_type() const override {
+        if constexpr (Data::result_nullable) {
+            return make_nullable(_argument_type);
+        } else {
+            return _argument_type;
+        }
+    }
 
     void insert_result_into(ConstAggregateDataPtr place, IColumn& to) const override {
         this->data(place).insert_result_into(to);
     }
 
-    void add(AggregateDataPtr place, const IColumn** columns, size_t row_num,
+    void add(AggregateDataPtr place, const IColumn** columns, ssize_t row_num,
              Arena* arena) const override {
         this->data(place).add(row_num, columns);
     }
@@ -219,16 +232,24 @@ public:
     void add_range_single_place(int64_t partition_start, int64_t partition_end, int64_t frame_start,
                                 int64_t frame_end, AggregateDataPtr place, const IColumn** columns,
                                 Arena* arena) const override {
-        LOG(FATAL) << "ReaderFunctionData do not support add_range_single_place";
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                               "ReaderFunctionData do not support add_range_single_place");
+        __builtin_unreachable();
     }
     void merge(AggregateDataPtr place, ConstAggregateDataPtr rhs, Arena*) const override {
-        LOG(FATAL) << "ReaderFunctionData do not support merge";
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                               "ReaderFunctionData do not support merge");
+        __builtin_unreachable();
     }
     void serialize(ConstAggregateDataPtr place, BufferWritable& buf) const override {
-        LOG(FATAL) << "ReaderFunctionData do not support serialize";
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                               "ReaderFunctionData do not support serialize");
+        __builtin_unreachable();
     }
     void deserialize(AggregateDataPtr place, BufferReadable& buf, Arena*) const override {
-        LOG(FATAL) << "ReaderFunctionData do not support deserialize";
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                               "ReaderFunctionData do not support deserialize");
+        __builtin_unreachable();
     }
 
 private:
@@ -237,20 +258,20 @@ private:
 
 template <template <typename> class AggregateFunctionTemplate, template <typename> class Impl,
           bool result_is_nullable, bool arg_is_nullable, bool is_copy = false>
-IAggregateFunction* create_function_single_value(const String& name,
-                                                 const DataTypes& argument_types) {
+AggregateFunctionPtr create_function_single_value(const String& name,
+                                                  const DataTypes& argument_types) {
     auto type = remove_nullable(argument_types[0]);
     WhichDataType which(*type);
 
-#define DISPATCH(TYPE, COLUMN_TYPE)                                       \
-    if (which.idx == TypeIndex::TYPE)                                     \
-        return new AggregateFunctionTemplate<Impl<ReaderFirstAndLastData< \
-                COLUMN_TYPE, result_is_nullable, arg_is_nullable, is_copy>>>(argument_types);
+#define DISPATCH(TYPE, COLUMN_TYPE)                                                    \
+    if (which.idx == TypeIndex::TYPE)                                                  \
+        return std::make_shared<AggregateFunctionTemplate<Impl<ReaderFirstAndLastData< \
+                COLUMN_TYPE, result_is_nullable, arg_is_nullable, is_copy>>>>(argument_types);
     TYPE_TO_COLUMN_TYPE(DISPATCH)
 #undef DISPATCH
 
-    LOG(FATAL) << "with unknowed type, failed in  create_aggregate_function_" << name
-               << " and type is: " << argument_types[0]->get_name();
+    LOG(WARNING) << "with unknowed type, failed in  create_aggregate_function_" << name
+                 << " and type is: " << argument_types[0]->get_name();
     return nullptr;
 }
 

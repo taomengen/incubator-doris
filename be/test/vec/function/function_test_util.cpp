@@ -17,10 +17,27 @@
 
 #include "vec/function/function_test_util.h"
 
+#include <glog/logging.h>
+
+#include <iostream>
+
 #include "runtime/jsonb_value.h"
+#include "runtime/runtime_state.h"
+#include "util/binary_cast.hpp"
+#include "util/bitmap_value.h"
+#include "vec/core/types.h"
 #include "vec/data_types/data_type_array.h"
 #include "vec/data_types/data_type_bitmap.h"
+#include "vec/data_types/data_type_date.h"
+#include "vec/data_types/data_type_date_time.h"
 #include "vec/data_types/data_type_decimal.h"
+#include "vec/data_types/data_type_ipv4.h"
+#include "vec/data_types/data_type_ipv6.h"
+#include "vec/data_types/data_type_jsonb.h"
+#include "vec/data_types/data_type_string.h"
+#include "vec/data_types/data_type_time_v2.h"
+#include "vec/exprs/table_function/table_function.h"
+#include "vec/runtime/vdatetime_value.h"
 
 namespace doris::vectorized {
 int64_t str_to_date_time(std::string datetime_str, bool data_time) {
@@ -48,6 +65,7 @@ uint64_t str_to_datetime_v2(std::string datetime_str, std::string datetime_forma
     return binary_cast<DateV2Value<DateTimeV2ValueType>, UInt64>(v);
 }
 
+// NOLINTBEGIN(readability-function-size)
 size_t type_index_to_data_type(const std::vector<AnyType>& input_types, size_t index,
                                ut_type::UTDataTypeDesc& ut_desc, DataTypePtr& type) {
     doris::TypeDescriptor& desc = ut_desc.type_desc;
@@ -84,6 +102,14 @@ size_t type_index_to_data_type(const std::vector<AnyType>& input_types, size_t i
         desc.type = doris::PrimitiveType::TYPE_OBJECT;
         type = std::make_shared<DataTypeBitMap>();
         return 1;
+    case TypeIndex::IPv4:
+        desc.type = doris::PrimitiveType::TYPE_IPV4;
+        type = std::make_shared<DataTypeIPv4>();
+        return 1;
+    case TypeIndex::IPv6:
+        desc.type = doris::PrimitiveType::TYPE_IPV6;
+        type = std::make_shared<DataTypeIPv6>();
+        return 1;
     case TypeIndex::UInt8:
         desc.type = doris::PrimitiveType::TYPE_BOOLEAN;
         type = std::make_shared<DataTypeUInt8>();
@@ -116,9 +142,26 @@ size_t type_index_to_data_type(const std::vector<AnyType>& input_types, size_t i
         desc.type = doris::PrimitiveType::TYPE_DOUBLE;
         type = std::make_shared<DataTypeFloat64>();
         return 1;
-    case TypeIndex::Decimal128:
+    case TypeIndex::Decimal128V2:
         desc.type = doris::PrimitiveType::TYPE_DECIMALV2;
-        type = std::make_shared<DataTypeDecimal<Decimal128>>();
+        type = std::make_shared<DataTypeDecimal<Decimal128V2>>();
+        return 1;
+    // for decimals in ut we set the default scale and precision. for more scales, we prefer test them in regression.
+    case TypeIndex::Decimal32:
+        desc.type = doris::PrimitiveType::TYPE_DECIMAL32;
+        type = std::make_shared<DataTypeDecimal<Decimal32>>(9, 5);
+        return 1;
+    case TypeIndex::Decimal64:
+        desc.type = doris::PrimitiveType::TYPE_DECIMAL64;
+        type = std::make_shared<DataTypeDecimal<Decimal64>>(18, 9);
+        return 1;
+    case TypeIndex::Decimal128V3:
+        desc.type = doris::PrimitiveType::TYPE_DECIMAL128I;
+        type = std::make_shared<DataTypeDecimal<Decimal128V3>>(38, 20);
+        return 1;
+    case TypeIndex::Decimal256:
+        desc.type = doris::PrimitiveType::TYPE_DECIMAL256;
+        type = std::make_shared<DataTypeDecimal<Decimal256>>(76, 40);
         return 1;
     case TypeIndex::DateTime:
         desc.type = doris::PrimitiveType::TYPE_DATETIME;
@@ -164,6 +207,8 @@ size_t type_index_to_data_type(const std::vector<AnyType>& input_types, size_t i
         return 0;
     }
 }
+// NOLINTEND(readability-function-size)
+
 bool parse_ut_data_type(const std::vector<AnyType>& input_types, ut_type::UTDataTypeDescs& descs) {
     descs.clear();
     descs.reserve(input_types.size());
@@ -178,7 +223,7 @@ bool parse_ut_data_type(const std::vector<AnyType>& input_types, ut_type::UTData
             return false;
         }
         if (desc.is_nullable) {
-            desc.data_type = make_nullable(std::move(desc.data_type));
+            desc.data_type = make_nullable(desc.data_type);
         }
         desc.col_name = "k" + std::to_string(i);
         descs.emplace_back(desc);
@@ -208,6 +253,7 @@ bool insert_date_cell(MutableColumnPtr& column, const std::string& format, const
     return true;
 }
 
+// NOLINTBEGIN(readability-function-size)
 bool insert_cell(MutableColumnPtr& column, DataTypePtr type_ptr, const AnyType& cell) {
     if (cell.type() == &typeid(Null)) {
         column->insert_data(nullptr, 0);
@@ -226,8 +272,14 @@ bool insert_cell(MutableColumnPtr& column, DataTypePtr type_ptr, const AnyType& 
         JsonBinaryValue jsonb_val(str.c_str(), str.size());
         column->insert_data(jsonb_val.value(), jsonb_val.size());
     } else if (type.idx == TypeIndex::BitMap) {
-        BitmapValue* bitmap = any_cast<BitmapValue*>(cell);
+        auto* bitmap = any_cast<BitmapValue*>(cell);
         column->insert_data((char*)bitmap, sizeof(BitmapValue));
+    } else if (type.is_ipv4()) {
+        auto value = any_cast<ut_type::IPV4>(cell);
+        column->insert_data(reinterpret_cast<char*>(&value), 0);
+    } else if (type.is_ipv6()) {
+        auto value = any_cast<ut_type::IPV6>(cell);
+        column->insert_data(reinterpret_cast<char*>(&value), 0);
     } else if (type.is_uint8()) {
         auto value = any_cast<ut_type::BOOLEAN>(cell);
         column->insert_data(reinterpret_cast<char*>(&value), 0);
@@ -252,8 +304,20 @@ bool insert_cell(MutableColumnPtr& column, DataTypePtr type_ptr, const AnyType& 
     } else if (type.is_float64()) {
         auto value = any_cast<ut_type::DOUBLE>(cell);
         column->insert_data(reinterpret_cast<char*>(&value), 0);
-    } else if (type.is_decimal128()) {
-        auto value = any_cast<Decimal<Int128>>(cell);
+    } else if (type.is_decimal128v2()) {
+        auto value = any_cast<Decimal128V2>(cell);
+        column->insert_data(reinterpret_cast<char*>(&value), 0);
+    } else if (type.is_decimal32()) {
+        auto value = any_cast<Decimal32>(cell);
+        column->insert_data(reinterpret_cast<char*>(&value), 0);
+    } else if (type.is_decimal64()) {
+        auto value = any_cast<Decimal64>(cell);
+        column->insert_data(reinterpret_cast<char*>(&value), 0);
+    } else if (type.is_decimal128v3()) {
+        auto value = any_cast<Decimal128V3>(cell);
+        column->insert_data(reinterpret_cast<char*>(&value), 0);
+    } else if (type.is_decimal256()) {
+        auto value = any_cast<Decimal256>(cell);
         column->insert_data(reinterpret_cast<char*>(&value), 0);
     } else if (type.is_date_time()) {
         static std::string date_time_format("%Y-%m-%d %H:%i:%s");
@@ -280,6 +344,7 @@ bool insert_cell(MutableColumnPtr& column, DataTypePtr type_ptr, const AnyType& 
     }
     return true;
 }
+// NOLINTEND(readability-function-size)
 
 Block* create_block_from_inputset(const InputTypeSet& input_types, const InputDataSet& input_set) {
     // 1.0 create data type
@@ -290,7 +355,7 @@ Block* create_block_from_inputset(const InputTypeSet& input_types, const InputDa
 
     // 1.1 insert data and create block
     auto row_size = input_set.size();
-    std::unique_ptr<Block> block(new Block());
+    std::unique_ptr<Block> block = Block::create_unique();
     for (size_t i = 0; i < descs.size(); ++i) {
         auto& desc = descs[i];
         auto column = desc.data_type->create_column();
@@ -327,49 +392,35 @@ Block* process_table_function(TableFunction* fn, Block* input_block,
         return nullptr;
     }
 
+    RuntimeState runtime_state((TQueryGlobals()));
     // process table function init
-    if (fn->process_init(input_block) != Status::OK()) {
+    if (fn->process_init(input_block, &runtime_state) != Status::OK()) {
         LOG(WARNING) << "TableFunction process_init failed";
         return nullptr;
     }
 
     // prepare output column
     vectorized::MutableColumnPtr column = descs[0].data_type->create_column();
+    if (column->is_nullable()) {
+        fn->set_nullable();
+    }
 
     // process table function for all rows
     for (size_t row = 0; row < input_block->rows(); ++row) {
-        if (fn->process_row(row) != Status::OK()) {
-            LOG(WARNING) << "TableFunction process_row failed";
-            return nullptr;
-        }
+        fn->process_row(row);
 
         // consider outer
         if (!fn->is_outer() && fn->current_empty()) {
             continue;
         }
 
-        bool tmp_eos = false;
         do {
-            void* cell = nullptr;
-            int64_t cell_len = 0;
-            if (fn->get_value(&cell) != Status::OK() ||
-                fn->get_value_length(&cell_len) != Status::OK()) {
-                LOG(WARNING) << "TableFunction get_value or get_value_length failed";
-                return nullptr;
-            }
-
-            // copy data from input block
-            if (cell == nullptr) {
-                column->insert_default();
-            } else {
-                column->insert_data(reinterpret_cast<char*>(cell), cell_len);
-            }
-
-            fn->forward(&tmp_eos);
-        } while (!tmp_eos);
+            fn->get_same_many_values(column, 1);
+            fn->forward();
+        } while (!fn->eos());
     }
 
-    std::unique_ptr<Block> output_block(new Block());
+    std::unique_ptr<Block> output_block = Block::create_unique();
     output_block->insert({std::move(column), descs[0].data_type, descs[0].col_name});
     return output_block.release();
 }

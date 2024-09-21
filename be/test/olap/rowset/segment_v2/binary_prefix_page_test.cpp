@@ -27,7 +27,6 @@
 #include "olap/rowset/segment_v2/page_builder.h"
 #include "olap/rowset/segment_v2/page_decoder.h"
 #include "olap/types.h"
-#include "runtime/mem_pool.h"
 #include "util/debug_util.h"
 #include "vec/data_types/data_type_factory.hpp"
 
@@ -49,6 +48,8 @@ public:
         // encode
         PageBuilderOptions options;
         BinaryPrefixPageBuilder page_builder(options);
+        Status ret0 = page_builder.init();
+        EXPECT_TRUE(ret0.ok());
 
         size_t count = slices.size();
         const Slice* ptr = &slices[0];
@@ -75,8 +76,8 @@ public:
         EXPECT_EQ(slices.size(), page_decoder->count());
 
         //check values
-        MemPool pool;
-        auto type_info = get_scalar_type_info(OLAP_FIELD_TYPE_VARCHAR);
+        vectorized::Arena pool;
+        auto type_info = get_scalar_type_info(FieldType::OLAP_FIELD_TYPE_VARCHAR);
         size_t size = slices.size();
         std::unique_ptr<ColumnVectorBatch> cvb;
         ColumnVectorBatch::create(size, false, type_info, nullptr, &cvb);
@@ -96,8 +97,8 @@ public:
         int n = 0;
         while (true) {
             //check values
-            MemPool pool;
-            auto type_info = get_scalar_type_info(OLAP_FIELD_TYPE_VARCHAR);
+            vectorized::Arena pool;
+            auto type_info = get_scalar_type_info(FieldType::OLAP_FIELD_TYPE_VARCHAR);
             std::unique_ptr<ColumnVectorBatch> cvb;
             size_t size = 6;
             ColumnVectorBatch::create(size, false, type_info, nullptr, &cvb);
@@ -133,7 +134,7 @@ public:
         Slice v1 = Slice("1039");
         bool exact_match;
         ret = page_decoder->seek_at_or_after_value(&v1, &exact_match);
-        EXPECT_TRUE(ret.is<NOT_FOUND>());
+        EXPECT_TRUE(ret.is<ENTRY_NOT_FOUND>());
 
         Slice v2 = Slice("1000");
         ret = page_decoder->seek_at_or_after_value(&v2, &exact_match);
@@ -163,6 +164,8 @@ public:
         // encode
         PageBuilderOptions options;
         BinaryPrefixPageBuilder page_builder(options);
+        Status ret0 = page_builder.init();
+        EXPECT_TRUE(ret0.ok());
 
         size_t count = slices.size();
         const Slice* ptr = &slices[0];
@@ -187,7 +190,7 @@ public:
         EXPECT_TRUE(ret.ok());
         // because every slice is unique
         EXPECT_EQ(slices.size(), page_decoder->count());
-        auto type_info = get_scalar_type_info(OLAP_FIELD_TYPE_VARCHAR);
+        auto type_info = get_scalar_type_info(FieldType::OLAP_FIELD_TYPE_VARCHAR);
         size_t size = slices.size();
 
         {
@@ -210,7 +213,6 @@ public:
             int n = 0;
             while (true) {
                 //check values
-                MemPool pool;
                 auto data_type = vectorized::DataTypeFactory::instance().create_data_type(
                         type_info->type(), 1, 0);
                 auto column = data_type->create_column();
@@ -245,7 +247,7 @@ public:
         Slice v1 = Slice("1039");
         bool exact_match;
         ret = page_decoder->seek_at_or_after_value(&v1, &exact_match);
-        EXPECT_TRUE(ret.is<NOT_FOUND>());
+        EXPECT_TRUE(ret.is<ENTRY_NOT_FOUND>());
 
         Slice v2 = Slice("1000");
         ret = page_decoder->seek_at_or_after_value(&v2, &exact_match);
@@ -275,6 +277,8 @@ public:
         // encode
         PageBuilderOptions options;
         BinaryPrefixPageBuilder page_builder(options);
+        Status ret0 = page_builder.init();
+        EXPECT_TRUE(ret0.ok());
 
         size_t count = slices.size();
         const Slice* ptr = &slices[0];

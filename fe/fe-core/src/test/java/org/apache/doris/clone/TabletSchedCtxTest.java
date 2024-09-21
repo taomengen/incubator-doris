@@ -37,19 +37,19 @@ public class TabletSchedCtxTest {
         // equal priority, but info3's last visit time is earlier than info2 and info1, so info1 should ranks ahead
         PriorityQueue<TabletSchedCtx> pendingTablets = new PriorityQueue<>();
         ReplicaAllocation replicaAlloc = ReplicaAllocation.DEFAULT_ALLOCATION;
-        TabletSchedCtx ctx1 = new TabletSchedCtx(Type.REPAIR, "default_cluster",
+        TabletSchedCtx ctx1 = new TabletSchedCtx(Type.REPAIR,
                 1, 2, 3, 4, 1000, replicaAlloc, System.currentTimeMillis());
-        ctx1.setOrigPriority(Priority.NORMAL);
+        ctx1.setPriority(Priority.NORMAL);
         ctx1.setLastVisitedTime(2);
 
-        TabletSchedCtx ctx2 = new TabletSchedCtx(Type.REPAIR, "default_cluster",
+        TabletSchedCtx ctx2 = new TabletSchedCtx(Type.REPAIR,
                 1, 2, 3, 4, 1001, replicaAlloc, System.currentTimeMillis());
-        ctx2.setOrigPriority(Priority.NORMAL);
+        ctx2.setPriority(Priority.NORMAL);
         ctx2.setLastVisitedTime(3);
 
-        TabletSchedCtx ctx3 = new TabletSchedCtx(Type.REPAIR, "default_cluster",
-                1, 2, 3, 4, 1001, replicaAlloc, System.currentTimeMillis());
-        ctx3.setOrigPriority(Priority.NORMAL);
+        TabletSchedCtx ctx3 = new TabletSchedCtx(Type.REPAIR,
+                1, 2, 3, 4, 1002, replicaAlloc, System.currentTimeMillis());
+        ctx3.setPriority(Priority.NORMAL);
         ctx3.setLastVisitedTime(1);
 
         pendingTablets.add(ctx1);
@@ -62,8 +62,8 @@ public class TabletSchedCtxTest {
 
         // priority is not equal, info2 is HIGH, should ranks ahead
         pendingTablets.clear();
-        ctx1.setOrigPriority(Priority.NORMAL);
-        ctx2.setOrigPriority(Priority.HIGH);
+        ctx1.setPriority(Priority.NORMAL);
+        ctx2.setPriority(Priority.HIGH);
         ctx1.setLastVisitedTime(2);
         ctx2.setLastVisitedTime(2);
         pendingTablets.add(ctx2);
@@ -84,19 +84,19 @@ public class TabletSchedCtxTest {
         TabletSchedCtx.VersionCountComparator countComparator = new TabletSchedCtx.VersionCountComparator();
         List<Replica> replicaList = Lists.newArrayList();
         Replica replica1 = new Replica();
-        replica1.setVersionCount(100);
+        replica1.setVisibleVersionCount(100);
         replica1.setState(Replica.ReplicaState.NORMAL);
 
         Replica replica2 = new Replica();
-        replica2.setVersionCount(50);
+        replica2.setVisibleVersionCount(50);
         replica2.setState(Replica.ReplicaState.NORMAL);
 
         Replica replica3 = new Replica();
-        replica3.setVersionCount(-1);
+        replica3.setVisibleVersionCount(-1);
         replica3.setState(Replica.ReplicaState.NORMAL);
 
         Replica replica4 = new Replica();
-        replica4.setVersionCount(200);
+        replica4.setVisibleVersionCount(200);
         replica4.setState(Replica.ReplicaState.NORMAL);
 
         replicaList.add(replica1);
@@ -105,10 +105,10 @@ public class TabletSchedCtxTest {
         replicaList.add(replica4);
 
         Collections.sort(replicaList, countComparator);
-        Assert.assertEquals(50, replicaList.get(0).getVersionCount());
-        Assert.assertEquals(100, replicaList.get(1).getVersionCount());
-        Assert.assertEquals(200, replicaList.get(2).getVersionCount());
-        Assert.assertEquals(-1, replicaList.get(3).getVersionCount());
+        Assert.assertEquals(50, replicaList.get(0).getVisibleVersionCount());
+        Assert.assertEquals(100, replicaList.get(1).getVisibleVersionCount());
+        Assert.assertEquals(200, replicaList.get(2).getVisibleVersionCount());
+        Assert.assertEquals(-1, replicaList.get(3).getVisibleVersionCount());
     }
 
 }

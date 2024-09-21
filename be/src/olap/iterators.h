@@ -17,12 +17,15 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
 
 #include "common/status.h"
+#include "io/io_common.h"
 #include "olap/block_column_predicate.h"
 #include "olap/column_predicate.h"
 #include "olap/olap_common.h"
+#include "olap/rowset/segment_v2/row_ranges.h"
 #include "olap/tablet_schema.h"
 #include "runtime/runtime_state.h"
 #include "vec/core/block.h"
@@ -34,28 +37,13 @@ class RowCursor;
 class Schema;
 class ColumnPredicate;
 
-struct IOContext {
-    IOContext() = default;
-
-    IOContext(const TUniqueId* query_id_, FileCacheStatistics* stats_, bool is_presistent_,
-              bool use_disposable_cache_, bool read_segment_index_, bool enable_file_cache)
-            : query_id(query_id_),
-              is_persistent(is_presistent_),
-              use_disposable_cache(use_disposable_cache_),
-              read_segment_index(read_segment_index_),
-              file_cache_stats(stats_),
-              enable_file_cache(enable_file_cache) {}
-    ReaderType reader_type;
-    const TUniqueId* query_id = nullptr;
-    bool is_persistent = false;
-    bool use_disposable_cache = false;
-    bool read_segment_index = false;
-    FileCacheStatistics* file_cache_stats = nullptr;
-    bool enable_file_cache = true;
-};
 namespace vectorized {
 struct IteratorRowRef;
 };
+
+namespace segment_v2 {
+struct SubstreamIterator;
+}
 
 class StorageReadOptions {
 public:
@@ -74,11 +62,11 @@ public:
                   include_upper(include_upper_) {}
 
         // the lower bound of the range, nullptr if not existed
-        const RowCursor* lower_key;
+        const RowCursor* lower_key = nullptr;
         // whether `lower_key` is included in the range
         bool include_lower;
         // the upper bound of the range, nullptr if not existed
-        const RowCursor* upper_key;
+        const RowCursor* upper_key = nullptr;
         // whether `upper_key` is included in the range
         bool include_upper;
     };
@@ -95,11 +83,10 @@ public:
     std::unordered_map<uint32_t, std::shared_ptr<roaring::Roaring>> delete_bitmap;
 
     std::shared_ptr<AndBlockColumnPredicate> delete_condition_predicates =
-            std::make_shared<AndBlockColumnPredicate>();
+            AndBlockColumnPredicate::create_shared();
     // reader's column predicate, nullptr if not existed
     // used to fiter rows in row block
     std::vector<ColumnPredicate*> column_predicates;
-    std::vector<ColumnPredicate*> column_predicates_except_leafnode_of_andnode;
     std::unordered_map<int32_t, std::shared_ptr<AndBlockColumnPredicate>> col_id_to_predicates;
     std::unordered_map<int32_t, std::vector<const ColumnPredicate*>> del_predicates_for_zone_map;
     TPushAggOp::type push_down_agg_type_opt = TPushAggOp::NONE;
@@ -110,22 +97,34 @@ public:
     int block_row_max = 4096 - 32; // see https://github.com/apache/doris/pull/11816
 
     TabletSchemaSPtr tablet_schema = nullptr;
+    bool enable_unique_key_merge_on_write = false;
     bool record_rowids = false;
-    // flag for enable topn opt
-    bool use_topn_opt = false;
+    std::vector<int> topn_filter_source_node_ids;
+    int topn_filter_target_node_id = -1;
     // used for special optimization for query : ORDER BY key DESC LIMIT n
     bool read_orderby_key_reverse = false;
     // columns for orderby keys
     std::vector<uint32_t>* read_orderby_key_columns = nullptr;
-    IOContext io_ctx;
+    io::IOContext io_ctx;
     vectorized::VExpr* remaining_vconjunct_root = nullptr;
-    vectorized::VExprContext* common_vexpr_ctxs_pushdown = nullptr;
+    std::vector<vectorized::VExprSPtr> remaining_conjunct_roots;
+    vectorized::VExprContextSPtrs common_expr_ctxs_push_down;
     const std::set<int32_t>* output_columns = nullptr;
     // runtime state
     RuntimeState* runtime_state = nullptr;
     RowsetId rowset_id;
     Version version;
-    int32_t tablet_id = 0;
+    int64_t tablet_id = 0;
+    // slots that cast may be eliminated in storage layer
+    std::map<std::string, TypeDescriptor> target_cast_type_for_variants;
+    RowRanges row_ranges;
+    size_t topn_limit = 0;
+};
+
+struct CompactionSampleInfo {
+    int64_t bytes = 0;
+    int64_t rows = 0;
+    int64_t group_data_size;
 };
 
 class RowwiseIterator;
@@ -140,7 +139,13 @@ public:
     // Input options may contain scan range in which this scan.
     // Return Status::OK() if init successfully,
     // Return other error otherwise
-    virtual Status init(const StorageReadOptions& opts) = 0;
+    virtual Status init(const StorageReadOptions& opts) {
+        return Status::NotSupported("to be implemented");
+    }
+
+    virtual Status init(const StorageReadOptions& opts, CompactionSampleInfo* sample_info) {
+        return Status::NotSupported("to be implemented");
+    }
 
     // If there is any valid data, this function will load data
     // into input batch with Status::OK() returned

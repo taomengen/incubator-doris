@@ -29,9 +29,10 @@
 #include "olap/utils.h"
 #include "runtime/collection_value.h"
 #include "runtime/map_value.h"
-#include "runtime/mem_pool.h"
 #include "util/hash_util.hpp"
 #include "util/slice.h"
+#include "vec/common/arena.h"
+#include "vec/json/path_in_data.h"
 
 namespace doris {
 
@@ -39,15 +40,18 @@ namespace doris {
 // User can use this class to access or deal with column data in memory.
 class Field {
 public:
-    explicit Field() : _type_info(TypeInfoPtr(nullptr, nullptr)) {}
-    explicit Field(const TabletColumn& column)
+    Field(const TabletColumn& column)
             : _type_info(get_type_info(&column)),
+              _desc(column),
               _length(column.length()),
               _key_coder(get_key_coder(column.type())),
               _name(column.name()),
               _index_size(column.index_length()),
               _is_nullable(column.is_nullable()),
-              _unique_id(column.unique_id()) {}
+              _unique_id(column.unique_id()),
+              _parent_unique_id(column.parent_unique_id()),
+              _is_extracted_column(column.is_extracted_column()),
+              _path(column.path_info_ptr()) {}
 
     virtual ~Field() = default;
 
@@ -56,7 +60,10 @@ public:
     size_t field_size() const { return size() + 1; }
     size_t index_size() const { return _index_size; }
     int32_t unique_id() const { return _unique_id; }
+    int32_t parent_unique_id() const { return _parent_unique_id; }
+    bool is_extracted_column() const { return _is_extracted_column; }
     const std::string& name() const { return _name; }
+    const vectorized::PathInDataPtr& path() const { return _path; }
 
     virtual void set_to_max(char* buf) const { return _type_info->set_to_max(buf); }
     virtual void set_to_zone_map_max(char* buf) const { set_to_max(buf); }
@@ -66,22 +73,22 @@ public:
 
     void set_long_text_buf(char** buf) { _long_text_buf = buf; }
 
-    // This function allocate memory from pool, other than allocate_memory
+    // This function allocate memory from arena, other than allocate_memory
     // reserve memory from continuous memory.
-    virtual char* allocate_value(MemPool* pool) const {
-        return (char*)pool->allocate(_type_info->size());
+    virtual char* allocate_value(vectorized::Arena* arena) const {
+        return arena->alloc(_type_info->size());
     }
 
-    virtual char* allocate_zone_map_value(MemPool* pool) const { return allocate_value(pool); }
-
-    virtual char* allocate_memory(char* cell_ptr, char* variable_ptr) const { return variable_ptr; }
+    virtual char* allocate_zone_map_value(vectorized::Arena* arena) const {
+        return allocate_value(arena);
+    }
 
     virtual size_t get_variable_len() const { return 0; }
 
     virtual void modify_zone_map_index(char*) const {}
 
     virtual Field* clone() const {
-        auto* local = new Field();
+        auto* local = new Field(_desc);
         this->clone(local);
         return local;
     }
@@ -123,7 +130,7 @@ public:
         if (is_null) {
             return;
         }
-        if (type() == OLAP_FIELD_TYPE_STRING) {
+        if (type() == FieldType::OLAP_FIELD_TYPE_STRING) {
             auto dst_slice = reinterpret_cast<Slice*>(dst->mutable_cell_ptr());
             auto src_slice = reinterpret_cast<const Slice*>(src.cell_ptr());
             if (dst_slice->size < src_slice->size) {
@@ -136,23 +143,23 @@ public:
     }
 
     // deep copy source cell' content to destination cell.
-    // For string type, this will allocate data form pool,
+    // For string type, this will allocate data form arena,
     // and copy source's content.
     template <typename DstCellType, typename SrcCellType>
-    void deep_copy(DstCellType* dst, const SrcCellType& src, MemPool* pool) const {
+    void deep_copy(DstCellType* dst, const SrcCellType& src, vectorized::Arena* arena) const {
         bool is_null = src.is_null();
         dst->set_is_null(is_null);
         if (is_null) {
             return;
         }
-        _type_info->deep_copy(dst->mutable_cell_ptr(), src.cell_ptr(), pool);
+        _type_info->deep_copy(dst->mutable_cell_ptr(), src.cell_ptr(), arena);
     }
 
     // used by init scan key stored in string format
     // value_string should end with '\0'
     Status from_string(char* buf, const std::string& value_string, const int precision = 0,
                        const int scale = 0) const {
-        if (type() == OLAP_FIELD_TYPE_STRING && !value_string.empty()) {
+        if (type() == FieldType::OLAP_FIELD_TYPE_STRING && !value_string.empty()) {
             auto slice = reinterpret_cast<Slice*>(buf);
             if (slice->size < value_string.size()) {
                 *_long_text_buf = static_cast<char*>(realloc(*_long_text_buf, value_string.size()));
@@ -202,9 +209,11 @@ public:
     void set_scale(int32_t scale) { _scale = scale; }
     int32_t get_precision() const { return _precision; }
     int32_t get_scale() const { return _scale; }
+    const TabletColumn& get_desc() const { return _desc; }
 
 protected:
     TypeInfoPtr _type_info;
+    TabletColumn _desc;
     // unit : byte
     // except for strings, other types have fixed lengths
     // Note that, the struct type itself has fixed length, but due to
@@ -212,17 +221,17 @@ protected:
     // a struct field is not fixed.
     uint32_t _length;
     // Since the length of the STRING type cannot be determined,
-    // only dynamic memory can be used. Mempool cannot realize realloc.
+    // only dynamic memory can be used. Arena cannot realize realloc.
     // The schema information is shared globally. Therefore,
     // dynamic memory can only be managed in thread local mode.
     // The memory will be created and released in rowcursor.
     char** _long_text_buf = nullptr;
 
-    char* allocate_string_value(MemPool* pool) const {
-        char* type_value = (char*)pool->allocate(sizeof(Slice));
+    char* allocate_string_value(vectorized::Arena* arena) const {
+        char* type_value = arena->alloc(sizeof(Slice));
         auto slice = reinterpret_cast<Slice*>(type_value);
         slice->size = _length;
-        slice->data = (char*)pool->allocate(slice->size);
+        slice->data = arena->alloc(slice->size);
         return type_value;
     }
 
@@ -236,6 +245,8 @@ protected:
         other->_precision = this->_precision;
         other->_scale = this->_scale;
         other->_unique_id = this->_unique_id;
+        other->_parent_unique_id = this->_parent_unique_id;
+        other->_is_extracted_column = this->_is_extracted_column;
         for (const auto& f : _sub_fields) {
             Field* item = f->clone();
             other->add_sub_field(std::unique_ptr<Field>(item));
@@ -253,32 +264,21 @@ private:
     int32_t _precision;
     int32_t _scale;
     int32_t _unique_id;
+    int32_t _parent_unique_id;
+    bool _is_extracted_column = false;
+    vectorized::PathInDataPtr _path;
 };
 
 class MapField : public Field {
 public:
-    explicit MapField(const TabletColumn& column) : Field(column) {}
-
-    // make variable_ptr memory allocate to cell_ptr as MapValue
-    char* allocate_memory(char* cell_ptr, char* variable_ptr) const override {
-        return variable_ptr + _length;
-    }
+    MapField(const TabletColumn& column) : Field(column) {}
 
     size_t get_variable_len() const override { return _length; }
 };
 
 class StructField : public Field {
 public:
-    explicit StructField(const TabletColumn& column) : Field(column) {}
-    char* allocate_memory(char* cell_ptr, char* variable_ptr) const override {
-        auto struct_v = (StructValue*)cell_ptr;
-        struct_v->set_values(reinterpret_cast<void**>(variable_ptr));
-        variable_ptr += _length;
-        for (size_t i = 0; i < get_sub_field_count(); i++) {
-            variable_ptr += get_sub_field(i)->get_variable_len();
-        }
-        return variable_ptr;
-    }
+    StructField(const TabletColumn& column) : Field(column) {}
 
     size_t get_variable_len() const override {
         size_t variable_len = _length;
@@ -291,40 +291,25 @@ public:
 
 class ArrayField : public Field {
 public:
-    explicit ArrayField(const TabletColumn& column) : Field(column) {}
-
-    char* allocate_memory(char* cell_ptr, char* variable_ptr) const override {
-        auto array_v = (CollectionValue*)cell_ptr;
-        array_v->set_null_signs(reinterpret_cast<bool*>(variable_ptr));
-        return variable_ptr + _length;
-    }
+    ArrayField(const TabletColumn& column) : Field(column) {}
 
     size_t get_variable_len() const override { return _length; }
 };
 
 class CharField : public Field {
 public:
-    explicit CharField() : Field() {}
-    explicit CharField(const TabletColumn& column) : Field(column) {}
+    CharField(const TabletColumn& column) : Field(column) {}
 
     size_t get_variable_len() const override { return _length; }
 
-    char* allocate_memory(char* cell_ptr, char* variable_ptr) const override {
-        auto slice = (Slice*)cell_ptr;
-        slice->data = variable_ptr;
-        slice->size = _length;
-        variable_ptr += slice->size;
-        return variable_ptr;
-    }
-
     CharField* clone() const override {
-        auto* local = new CharField();
+        auto* local = new CharField(_desc);
         Field::clone(local);
         return local;
     }
 
-    char* allocate_value(MemPool* pool) const override {
-        return Field::allocate_string_value(pool);
+    char* allocate_value(vectorized::Arena* arena) const override {
+        return Field::allocate_string_value(arena);
     }
 
     void set_to_max(char* ch) const override {
@@ -336,11 +321,11 @@ public:
     // To prevent zone map cost too many memory, if varchar length
     // longer than `MAX_ZONE_MAP_INDEX_SIZE`. we just allocate
     // `MAX_ZONE_MAP_INDEX_SIZE` of memory
-    char* allocate_zone_map_value(MemPool* pool) const override {
-        char* type_value = (char*)pool->allocate(sizeof(Slice));
+    char* allocate_zone_map_value(vectorized::Arena* arena) const override {
+        char* type_value = arena->alloc(sizeof(Slice));
         auto slice = reinterpret_cast<Slice*>(type_value);
         slice->size = MAX_ZONE_MAP_INDEX_SIZE > _length ? _length : MAX_ZONE_MAP_INDEX_SIZE;
-        slice->data = (char*)pool->allocate(slice->size);
+        slice->data = arena->alloc(slice->size);
         return type_value;
     }
 
@@ -365,38 +350,28 @@ public:
 
 class VarcharField : public Field {
 public:
-    explicit VarcharField() : Field() {}
-    explicit VarcharField(const TabletColumn& column) : Field(column) {}
+    VarcharField(const TabletColumn& column) : Field(column) {}
 
     size_t get_variable_len() const override { return _length - OLAP_VARCHAR_MAX_BYTES; }
 
-    // minus OLAP_VARCHAR_MAX_BYTES here just for being compatible with old storage format
-    char* allocate_memory(char* cell_ptr, char* variable_ptr) const override {
-        auto slice = (Slice*)cell_ptr;
-        slice->data = variable_ptr;
-        slice->size = _length - OLAP_VARCHAR_MAX_BYTES;
-        variable_ptr += slice->size;
-        return variable_ptr;
-    }
-
     VarcharField* clone() const override {
-        auto* local = new VarcharField();
+        auto* local = new VarcharField(_desc);
         Field::clone(local);
         return local;
     }
 
-    char* allocate_value(MemPool* pool) const override {
-        return Field::allocate_string_value(pool);
+    char* allocate_value(vectorized::Arena* arena) const override {
+        return Field::allocate_string_value(arena);
     }
 
     // To prevent zone map cost too many memory, if varchar length
     // longer than `MAX_ZONE_MAP_INDEX_SIZE`. we just allocate
     // `MAX_ZONE_MAP_INDEX_SIZE` of memory
-    char* allocate_zone_map_value(MemPool* pool) const override {
-        char* type_value = (char*)pool->allocate(sizeof(Slice));
+    char* allocate_zone_map_value(vectorized::Arena* arena) const override {
+        char* type_value = arena->alloc(sizeof(Slice));
         auto slice = reinterpret_cast<Slice*>(type_value);
         slice->size = MAX_ZONE_MAP_INDEX_SIZE > _length ? _length : MAX_ZONE_MAP_INDEX_SIZE;
-        slice->data = (char*)pool->allocate(slice->size);
+        slice->data = arena->alloc(slice->size);
         return type_value;
     }
 
@@ -426,29 +401,23 @@ public:
 };
 class StringField : public Field {
 public:
-    explicit StringField() : Field() {}
-    explicit StringField(const TabletColumn& column) : Field(column) {}
-
-    // minus OLAP_VARCHAR_MAX_BYTES here just for being compatible with old storage format
-    char* allocate_memory(char* cell_ptr, char* variable_ptr) const override {
-        return variable_ptr;
-    }
+    StringField(const TabletColumn& column) : Field(column) {}
 
     StringField* clone() const override {
-        auto* local = new StringField();
+        auto* local = new StringField(_desc);
         Field::clone(local);
         return local;
     }
 
-    char* allocate_value(MemPool* pool) const override {
-        return Field::allocate_string_value(pool);
+    char* allocate_value(vectorized::Arena* arena) const override {
+        return Field::allocate_string_value(arena);
     }
 
-    char* allocate_zone_map_value(MemPool* pool) const override {
-        char* type_value = (char*)pool->allocate(sizeof(Slice));
+    char* allocate_zone_map_value(vectorized::Arena* arena) const override {
+        char* type_value = arena->alloc(sizeof(Slice));
         auto slice = reinterpret_cast<Slice*>(type_value);
         slice->size = MAX_ZONE_MAP_INDEX_SIZE;
-        slice->data = (char*)pool->allocate(slice->size);
+        slice->data = arena->alloc(slice->size);
         return type_value;
     }
     void set_to_max(char* ch) const override {
@@ -478,17 +447,10 @@ public:
 
 class BitmapAggField : public Field {
 public:
-    explicit BitmapAggField() : Field() {}
-    explicit BitmapAggField(const TabletColumn& column) : Field(column) {}
-
-    char* allocate_memory(char* cell_ptr, char* variable_ptr) const override {
-        auto slice = (Slice*)cell_ptr;
-        slice->data = nullptr;
-        return variable_ptr;
-    }
+    BitmapAggField(const TabletColumn& column) : Field(column) {}
 
     BitmapAggField* clone() const override {
-        auto* local = new BitmapAggField();
+        auto* local = new BitmapAggField(_desc);
         Field::clone(local);
         return local;
     }
@@ -496,17 +458,21 @@ public:
 
 class QuantileStateAggField : public Field {
 public:
-    explicit QuantileStateAggField() : Field() {}
-    explicit QuantileStateAggField(const TabletColumn& column) : Field(column) {}
-
-    char* allocate_memory(char* cell_ptr, char* variable_ptr) const override {
-        auto slice = (Slice*)cell_ptr;
-        slice->data = nullptr;
-        return variable_ptr;
-    }
+    QuantileStateAggField(const TabletColumn& column) : Field(column) {}
 
     QuantileStateAggField* clone() const override {
-        auto* local = new QuantileStateAggField();
+        auto* local = new QuantileStateAggField(_desc);
+        Field::clone(local);
+        return local;
+    }
+};
+
+class AggStateField : public Field {
+public:
+    AggStateField(const TabletColumn& column) : Field(column) {}
+
+    AggStateField* clone() const override {
+        auto* local = new AggStateField(_desc);
         Field::clone(local);
         return local;
     }
@@ -514,17 +480,10 @@ public:
 
 class HllAggField : public Field {
 public:
-    explicit HllAggField() : Field() {}
-    explicit HllAggField(const TabletColumn& column) : Field(column) {}
-
-    char* allocate_memory(char* cell_ptr, char* variable_ptr) const override {
-        auto slice = (Slice*)cell_ptr;
-        slice->data = nullptr;
-        return variable_ptr;
-    }
+    HllAggField(const TabletColumn& column) : Field(column) {}
 
     HllAggField* clone() const override {
-        auto* local = new HllAggField();
+        auto* local = new HllAggField(_desc);
         Field::clone(local);
         return local;
     }
@@ -536,13 +495,12 @@ public:
         // for key column
         if (column.is_key()) {
             switch (column.type()) {
-            case OLAP_FIELD_TYPE_CHAR:
+            case FieldType::OLAP_FIELD_TYPE_CHAR:
                 return new CharField(column);
-            case OLAP_FIELD_TYPE_VARCHAR:
-                return new VarcharField(column);
-            case OLAP_FIELD_TYPE_STRING:
+            case FieldType::OLAP_FIELD_TYPE_VARCHAR:
+            case FieldType::OLAP_FIELD_TYPE_STRING:
                 return new StringField(column);
-            case OLAP_FIELD_TYPE_STRUCT: {
+            case FieldType::OLAP_FIELD_TYPE_STRUCT: {
                 auto* local = new StructField(column);
                 for (uint32_t i = 0; i < column.get_subtype_count(); i++) {
                     std::unique_ptr<Field> sub_field(
@@ -551,13 +509,13 @@ public:
                 }
                 return local;
             }
-            case OLAP_FIELD_TYPE_ARRAY: {
+            case FieldType::OLAP_FIELD_TYPE_ARRAY: {
                 std::unique_ptr<Field> item_field(FieldFactory::create(column.get_sub_column(0)));
                 auto* local = new ArrayField(column);
                 local->add_sub_field(std::move(item_field));
                 return local;
             }
-            case OLAP_FIELD_TYPE_MAP: {
+            case FieldType::OLAP_FIELD_TYPE_MAP: {
                 std::unique_ptr<Field> key_field(FieldFactory::create(column.get_sub_column(0)));
                 std::unique_ptr<Field> val_field(FieldFactory::create(column.get_sub_column(1)));
                 auto* local = new MapField(column);
@@ -565,15 +523,17 @@ public:
                 local->add_sub_field(std::move(val_field));
                 return local;
             }
-            case OLAP_FIELD_TYPE_DECIMAL:
+            case FieldType::OLAP_FIELD_TYPE_DECIMAL:
                 [[fallthrough]];
-            case OLAP_FIELD_TYPE_DECIMAL32:
+            case FieldType::OLAP_FIELD_TYPE_DECIMAL32:
                 [[fallthrough]];
-            case OLAP_FIELD_TYPE_DECIMAL64:
+            case FieldType::OLAP_FIELD_TYPE_DECIMAL64:
                 [[fallthrough]];
-            case OLAP_FIELD_TYPE_DECIMAL128I:
+            case FieldType::OLAP_FIELD_TYPE_DECIMAL128I:
                 [[fallthrough]];
-            case OLAP_FIELD_TYPE_DATETIMEV2: {
+            case FieldType::OLAP_FIELD_TYPE_DECIMAL256:
+                [[fallthrough]];
+            case FieldType::OLAP_FIELD_TYPE_DATETIMEV2: {
                 Field* field = new Field(column);
                 field->set_precision(column.precision());
                 field->set_scale(column.frac());
@@ -586,20 +546,20 @@ public:
 
         // for value column
         switch (column.aggregation()) {
-        case OLAP_FIELD_AGGREGATION_NONE:
-        case OLAP_FIELD_AGGREGATION_SUM:
-        case OLAP_FIELD_AGGREGATION_MIN:
-        case OLAP_FIELD_AGGREGATION_MAX:
-        case OLAP_FIELD_AGGREGATION_REPLACE:
-        case OLAP_FIELD_AGGREGATION_REPLACE_IF_NOT_NULL:
+        case FieldAggregationMethod::OLAP_FIELD_AGGREGATION_NONE:
+        case FieldAggregationMethod::OLAP_FIELD_AGGREGATION_SUM:
+        case FieldAggregationMethod::OLAP_FIELD_AGGREGATION_MIN:
+        case FieldAggregationMethod::OLAP_FIELD_AGGREGATION_MAX:
+        case FieldAggregationMethod::OLAP_FIELD_AGGREGATION_REPLACE:
+        case FieldAggregationMethod::OLAP_FIELD_AGGREGATION_REPLACE_IF_NOT_NULL:
             switch (column.type()) {
-            case OLAP_FIELD_TYPE_CHAR:
+            case FieldType::OLAP_FIELD_TYPE_CHAR:
                 return new CharField(column);
-            case OLAP_FIELD_TYPE_VARCHAR:
+            case FieldType::OLAP_FIELD_TYPE_VARCHAR:
                 return new VarcharField(column);
-            case OLAP_FIELD_TYPE_STRING:
+            case FieldType::OLAP_FIELD_TYPE_STRING:
                 return new StringField(column);
-            case OLAP_FIELD_TYPE_STRUCT: {
+            case FieldType::OLAP_FIELD_TYPE_STRUCT: {
                 auto* local = new StructField(column);
                 for (uint32_t i = 0; i < column.get_subtype_count(); i++) {
                     std::unique_ptr<Field> sub_field(
@@ -608,13 +568,13 @@ public:
                 }
                 return local;
             }
-            case OLAP_FIELD_TYPE_ARRAY: {
+            case FieldType::OLAP_FIELD_TYPE_ARRAY: {
                 std::unique_ptr<Field> item_field(FieldFactory::create(column.get_sub_column(0)));
                 auto* local = new ArrayField(column);
                 local->add_sub_field(std::move(item_field));
                 return local;
             }
-            case OLAP_FIELD_TYPE_MAP: {
+            case FieldType::OLAP_FIELD_TYPE_MAP: {
                 DCHECK(column.get_subtype_count() == 2);
                 auto* local = new MapField(column);
                 std::unique_ptr<Field> key_field(FieldFactory::create(column.get_sub_column(0)));
@@ -623,15 +583,17 @@ public:
                 local->add_sub_field(std::move(value_field));
                 return local;
             }
-            case OLAP_FIELD_TYPE_DECIMAL:
+            case FieldType::OLAP_FIELD_TYPE_DECIMAL:
                 [[fallthrough]];
-            case OLAP_FIELD_TYPE_DECIMAL32:
+            case FieldType::OLAP_FIELD_TYPE_DECIMAL32:
                 [[fallthrough]];
-            case OLAP_FIELD_TYPE_DECIMAL64:
+            case FieldType::OLAP_FIELD_TYPE_DECIMAL64:
                 [[fallthrough]];
-            case OLAP_FIELD_TYPE_DECIMAL128I:
+            case FieldType::OLAP_FIELD_TYPE_DECIMAL128I:
                 [[fallthrough]];
-            case OLAP_FIELD_TYPE_DATETIMEV2: {
+            case FieldType::OLAP_FIELD_TYPE_DECIMAL256:
+                [[fallthrough]];
+            case FieldType::OLAP_FIELD_TYPE_DATETIMEV2: {
                 Field* field = new Field(column);
                 field->set_precision(column.precision());
                 field->set_scale(column.frac());
@@ -640,22 +602,23 @@ public:
             default:
                 return new Field(column);
             }
-        case OLAP_FIELD_AGGREGATION_HLL_UNION:
+        case FieldAggregationMethod::OLAP_FIELD_AGGREGATION_HLL_UNION:
             return new HllAggField(column);
-        case OLAP_FIELD_AGGREGATION_BITMAP_UNION:
+        case FieldAggregationMethod::OLAP_FIELD_AGGREGATION_BITMAP_UNION:
             return new BitmapAggField(column);
-        case OLAP_FIELD_AGGREGATION_QUANTILE_UNION:
+        case FieldAggregationMethod::OLAP_FIELD_AGGREGATION_QUANTILE_UNION:
             return new QuantileStateAggField(column);
-        case OLAP_FIELD_AGGREGATION_UNKNOWN:
-            LOG(WARNING) << "WOW! value column agg type is unknown";
+        case FieldAggregationMethod::OLAP_FIELD_AGGREGATION_GENERIC:
+            return new AggStateField(column);
+        case FieldAggregationMethod::OLAP_FIELD_AGGREGATION_UNKNOWN:
+            CHECK(false) << ", value column no agg type";
             return nullptr;
         }
-        LOG(WARNING) << "WOW! value column no agg type";
         return nullptr;
     }
 
     static Field* create_by_type(const FieldType& type) {
-        TabletColumn column(OLAP_FIELD_AGGREGATION_NONE, type);
+        TabletColumn column(FieldAggregationMethod::OLAP_FIELD_AGGREGATION_NONE, type);
         return create(column);
     }
 };

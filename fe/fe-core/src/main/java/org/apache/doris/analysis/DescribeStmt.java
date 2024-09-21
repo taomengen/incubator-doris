@@ -45,7 +45,10 @@ import org.apache.doris.qe.ShowResultSetMetaData;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
-import org.apache.commons.lang.StringUtils;
+import com.google.common.collect.Sets;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -54,18 +57,22 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-public class DescribeStmt extends ShowStmt {
+public class DescribeStmt extends ShowStmt implements NotFallbackInParser {
+    private static final Logger LOG = LogManager.getLogger(DescribeStmt.class);
     private static final ShowResultSetMetaData DESC_OLAP_TABLE_ALL_META_DATA =
             ShowResultSetMetaData.builder()
                     .addColumn(new Column("IndexName", ScalarType.createVarchar(20)))
                     .addColumn(new Column("IndexKeysType", ScalarType.createVarchar(20)))
                     .addColumn(new Column("Field", ScalarType.createVarchar(20)))
                     .addColumn(new Column("Type", ScalarType.createVarchar(20)))
+                    .addColumn(new Column("InternalType", ScalarType.createVarchar(20)))
                     .addColumn(new Column("Null", ScalarType.createVarchar(10)))
                     .addColumn(new Column("Key", ScalarType.createVarchar(10)))
                     .addColumn(new Column("Default", ScalarType.createVarchar(30)))
                     .addColumn(new Column("Extra", ScalarType.createVarchar(30)))
                     .addColumn(new Column("Visible", ScalarType.createVarchar(10)))
+                    .addColumn(new Column("DefineExpr", ScalarType.createVarchar(30)))
+                    .addColumn(new Column("WhereClause", ScalarType.createVarchar(30)))
                     .build();
 
     private static final ShowResultSetMetaData DESC_MYSQL_TABLE_ALL_META_DATA =
@@ -83,6 +90,7 @@ public class DescribeStmt extends ShowStmt {
 
     private TableName dbTableName;
     private ProcNodeInterface node;
+    private PartitionNames partitionNames;
 
     List<List<String>> totalRows = new LinkedList<List<String>>();
 
@@ -95,6 +103,12 @@ public class DescribeStmt extends ShowStmt {
     public DescribeStmt(TableName dbTableName, boolean isAllTables) {
         this.dbTableName = dbTableName;
         this.isAllTables = isAllTables;
+    }
+
+    public DescribeStmt(TableName dbTableName, boolean isAllTables, PartitionNames partitionNames) {
+        this.dbTableName = dbTableName;
+        this.isAllTables = isAllTables;
+        this.partitionNames = partitionNames;
     }
 
     public DescribeStmt(TableValuedFunctionRef tableValuedFunctionRef) {
@@ -114,8 +128,8 @@ public class DescribeStmt extends ShowStmt {
             List<Column> columns = tableValuedFunctionRef.getTable().getBaseSchema();
             for (Column column : columns) {
                 List<String> row = Arrays.asList(
-                        column.getDisplayName(),
-                        column.getOriginType().toString(),
+                        column.getName(),
+                        column.getOriginType().hideVersionForVersionColumn(true),
                         column.isAllowNull() ? "Yes" : "No",
                         ((Boolean) column.isKey()).toString(),
                         column.getDefaultValue() == null
@@ -125,6 +139,13 @@ public class DescribeStmt extends ShowStmt {
                 totalRows.add(row);
             }
             return;
+        }
+
+        if (partitionNames != null) {
+            partitionNames.analyze(analyzer);
+            if (partitionNames.isTemp()) {
+                throw new AnalysisException("Do not support temp partitions");
+            }
         }
 
         dbTableName.analyze(analyzer);
@@ -146,19 +167,32 @@ public class DescribeStmt extends ShowStmt {
                 // show base table schema only
                 String procString = "/catalogs/" + catalog.getId() + "/" + db.getId() + "/" + table.getId() + "/"
                         + TableProcDir.INDEX_SCHEMA + "/";
-                if (table.getType() == TableType.OLAP) {
+                if (table instanceof OlapTable) {
                     procString += ((OlapTable) table).getBaseIndexId();
                 } else {
+                    if (partitionNames != null) {
+                        throw new AnalysisException(dbTableName.getTbl()
+                                            + " is not a OLAP table, describe table failed");
+                    }
                     procString += table.getId();
                 }
-
+                if (partitionNames != null) {
+                    procString += "/";
+                    StringBuilder builder = new StringBuilder();
+                    for (String str : partitionNames.getPartitionNames()) {
+                        builder.append(str);
+                        builder.append(",");
+                    }
+                    builder.deleteCharAt(builder.length() - 1);
+                    procString += builder.toString();
+                }
                 node = ProcService.getInstance().open(procString);
                 if (node == null) {
                     throw new AnalysisException("Describe table[" + dbTableName.getTbl() + "] failed");
                 }
             } else {
                 Util.prohibitExternalCatalog(dbTableName.getCtl(), this.getClass().getSimpleName() + " ALL");
-                if (table.getType() == TableType.OLAP) {
+                if (table instanceof OlapTable) {
                     isOlapTable = true;
                     OlapTable olapTable = (OlapTable) table;
                     Set<String> bfColumns = olapTable.getCopiedBfColumns();
@@ -185,7 +219,7 @@ public class DescribeStmt extends ShowStmt {
                             // Extra string (aggregation and bloom filter)
                             List<String> extras = Lists.newArrayList();
                             if (column.getAggregationType() != null) {
-                                extras.add(column.getAggregationType().name());
+                                extras.add(column.getAggregationString());
                             }
                             if (bfColumns != null && bfColumns.contains(column.getName())) {
                                 extras.add("BLOOM_FILTER");
@@ -195,19 +229,47 @@ public class DescribeStmt extends ShowStmt {
                             List<String> row = Arrays.asList(
                                     "",
                                     "",
-                                    column.getDisplayName(),
+                                    column.getName(),
+                                    column.getOriginType().toString(),
                                     column.getOriginType().toString(),
                                     column.isAllowNull() ? "Yes" : "No",
                                     ((Boolean) column.isKey()).toString(),
                                     column.getDefaultValue() == null
-                                            ? FeConstants.null_string : column.getDefaultValue(),
+                                            ? FeConstants.null_string
+                                            : column.getDefaultValue(),
                                     extraStr,
-                                    ((Boolean) column.isVisible()).toString()
-                            );
+                                    ((Boolean) column.isVisible()).toString(),
+                                    column.getDefineExpr() == null ? "" : column.getDefineExpr().toSql(),
+                                    "");
+
+                            if (column.getOriginType().isDatetimeV2()) {
+                                StringBuilder typeStr = new StringBuilder("DATETIME");
+                                if (((ScalarType) column.getOriginType()).getScalarScale() > 0) {
+                                    typeStr.append("(").append(((ScalarType) column.getOriginType()).getScalarScale())
+                                            .append(")");
+                                }
+                                row.set(3, typeStr.toString());
+                            } else if (column.getOriginType().isDateV2()) {
+                                row.set(3, "DATE");
+                            } else if (column.getOriginType().isDecimalV3()) {
+                                StringBuilder typeStr = new StringBuilder("DECIMAL");
+                                ScalarType sType = (ScalarType) column.getOriginType();
+                                int scale = sType.getScalarScale();
+                                int precision = sType.getScalarPrecision();
+                                // not default
+                                if (scale > 0 && precision != 9) {
+                                    typeStr.append("(").append(precision).append(", ").append(scale)
+                                            .append(")");
+                                }
+                                row.set(3, typeStr.toString());
+                            }
 
                             if (j == 0) {
                                 row.set(0, indexName);
                                 row.set(1, indexMeta.getKeysType().name());
+                                Expr where = indexMeta.getWhereClause();
+                                row.set(DESC_OLAP_TABLE_ALL_META_DATA.getColumns().size() - 1,
+                                        where == null ? "" : where.toSqlWithoutTbl());
                             }
 
                             totalRows.add(row);
@@ -272,7 +334,21 @@ public class DescribeStmt extends ShowStmt {
                 return totalRows;
             }
             Preconditions.checkNotNull(node);
-            return node.fetchResult().getRows();
+            List<List<String>> rows = node.fetchResult().getRows();
+            List<List<String>> res = new ArrayList<>();
+            for (List<String> row : rows) {
+                try {
+                    Env.getCurrentEnv().getAccessManager()
+                            .checkColumnsPriv(ConnectContext.get().getCurrentUserIdentity(), dbTableName.getCtl(),
+                                    getDb(), getTableName(), Sets.newHashSet(row.get(0)), PrivPredicate.SHOW);
+                    res.add(row);
+                } catch (UserException e) {
+                    if (LOG.isDebugEnabled()) {
+                        LOG.debug(e.getMessage());
+                    }
+                }
+            }
+            return res;
         }
     }
 

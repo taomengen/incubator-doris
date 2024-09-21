@@ -17,30 +17,55 @@
 
 #pragma once
 
-#include "operator.h"
+#include <stdint.h>
 
-namespace doris::vectorized {
-class VDataGenFunctionScanNode;
-} // namespace doris::vectorized
+#include "common/status.h"
+#include "pipeline/common/data_gen_functions/vdata_gen_function_inf.h"
+#include "pipeline/exec/operator.h"
+
+namespace doris {
+class RuntimeState;
+} // namespace doris
 
 namespace doris::pipeline {
 
-class DataGenOperatorBuilder : public OperatorBuilder<vectorized::VDataGenFunctionScanNode> {
+class DataGenSourceOperatorX;
+class DataGenLocalState final : public PipelineXLocalState<> {
 public:
-    DataGenOperatorBuilder(int32_t id, ExecNode* exec_node);
-    bool is_source() const override { return true; }
-    OperatorPtr build_operator() override;
+    ENABLE_FACTORY_CREATOR(DataGenLocalState);
+
+    DataGenLocalState(RuntimeState* state, OperatorXBase* parent)
+            : PipelineXLocalState<>(state, parent) {}
+    ~DataGenLocalState() = default;
+
+    Status init(RuntimeState* state, LocalStateInfo& info) override;
+    Status close(RuntimeState* state) override;
+
+private:
+    friend class DataGenSourceOperatorX;
+    std::shared_ptr<VDataGenFunctionInf> _table_func;
 };
 
-class DataGenOperator : public SourceOperator<DataGenOperatorBuilder> {
+class DataGenSourceOperatorX final : public OperatorX<DataGenLocalState> {
 public:
-    DataGenOperator(OperatorBuilderBase* operator_builder, ExecNode* datagen_node);
+    DataGenSourceOperatorX(ObjectPool* pool, const TPlanNode& tnode, int operator_id,
+                           const DescriptorTbl& descs);
 
-    bool can_read() override { return true; }
-
+    Status init(const TPlanNode& tnode, RuntimeState* state) override;
     Status open(RuntimeState* state) override;
+    Status get_block(RuntimeState* state, vectorized::Block* block, bool* eos) override;
 
-    Status close(RuntimeState* state) override;
+    [[nodiscard]] bool is_source() const override { return true; }
+
+private:
+    friend class DataGenLocalState;
+    // Tuple id resolved in prepare() to set _tuple_desc;
+    TupleId _tuple_id;
+
+    // Descriptor of tuples generated
+    const TupleDescriptor* _tuple_desc = nullptr;
+
+    std::vector<TRuntimeFilterDesc> _runtime_filter_descs;
 };
 
 } // namespace doris::pipeline

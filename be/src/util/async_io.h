@@ -21,7 +21,7 @@
 
 #include "io/fs/file_system.h"
 #include "olap/olap_define.h"
-#include "priority_thread_pool.hpp"
+#include "work_thread_pool.hpp"
 
 namespace doris {
 
@@ -61,8 +61,8 @@ public:
     // the bthread will continue to execute.
     static void run_task(std::function<void()> fn, io::FileSystemType file_type) {
         DCHECK(bthread_self() != 0);
-        doris::Mutex mutex;
-        doris::ConditionVariable cv;
+        std::mutex mutex;
+        std::condition_variable cv;
         std::unique_lock l(mutex);
 
         AsyncIOCtx* ctx = static_cast<AsyncIOCtx*>(bthread_getspecific(btls_io_ctx_key));
@@ -81,10 +81,10 @@ public:
             cv.notify_one();
         };
 
-        if (file_type == io::FileSystemType::S3) {
-            AsyncIO::instance().remote_thread_pool()->offer(task);
-        } else {
+        if (file_type == io::FileSystemType::LOCAL) {
             AsyncIO::instance().io_thread_pool()->offer(task);
+        } else {
+            AsyncIO::instance().remote_thread_pool()->offer(task);
         }
         cv.wait(l);
     }

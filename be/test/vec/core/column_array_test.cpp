@@ -17,11 +17,13 @@
 
 #include "vec/columns/column_array.h"
 
-#include <gtest/gtest.h>
+#include <gtest/gtest-message.h>
+#include <gtest/gtest-test-part.h>
 
-#include <memory>
 #include <string>
+#include <vector>
 
+#include "gtest/gtest_pred_impl.h"
 #include "vec/columns/column.h"
 #include "vec/columns/column_string.h"
 #include "vec/columns/column_vector.h"
@@ -182,54 +184,6 @@ TEST(ColumnArrayTest, EmptyArrayPermuteTest) {
     auto res2 = array_column.permute(perm, 0);
     check_array_offsets(*res2, {0, 0, 0, 0});
     check_array_data<int32_t>(*res2, {});
-}
-
-TEST(ColumnArrayTest, IntArrayReplicateTest) {
-    auto off_column = ColumnVector<ColumnArray::Offset64>::create();
-    auto data_column = ColumnVector<int32_t>::create();
-    // init column array with [[1,2,3],[],[4],[5,6]]
-    std::vector<ColumnArray::Offset64> offs = {0, 3, 3, 4, 6};
-    std::vector<int32_t> vals = {1, 2, 3, 4, 5, 6};
-    for (size_t i = 1; i < offs.size(); ++i) {
-        off_column->insert_data((const char*)(&offs[i]), 0);
-    }
-    for (auto& v : vals) {
-        data_column->insert_data((const char*)(&v), 0);
-    }
-    ColumnArray array_column(std::move(data_column), std::move(off_column));
-
-    uint32_t counts[] = {2, 1, 0, 3}; // size should be equal array_column.size()
-    size_t target_size = 6;           // sum(counts)
-
-    // return array column: [[1,2,3],[1,2,3],[],[5,6],[5,6],[5,6]];
-    auto res1 = array_column.clone_empty();
-    array_column.replicate(counts, target_size, *res1);
-    check_array_offsets(*res1, {3, 6, 6, 8, 10, 12});
-    check_array_data<int32_t>(*res1, {1, 2, 3, 1, 2, 3, 5, 6, 5, 6, 5, 6});
-}
-
-TEST(ColumnArrayTest, StringArrayReplicateTest) {
-    auto off_column = ColumnVector<ColumnArray::Offset64>::create();
-    auto data_column = ColumnString::create();
-    // init column array with [["abc","d"],["ef"],[], [""]];
-    std::vector<ColumnArray::Offset64> offs = {0, 2, 3, 3, 4};
-    std::vector<std::string> vals = {"abc", "d", "ef", ""};
-    for (size_t i = 1; i < offs.size(); ++i) {
-        off_column->insert_data((const char*)(&offs[i]), 0);
-    }
-    for (auto& v : vals) {
-        data_column->insert_data(v.data(), v.size());
-    }
-    ColumnArray array_column(std::move(data_column), std::move(off_column));
-
-    uint32_t counts[] = {2, 1, 0, 3}; // size should be equal array_column.size()
-    size_t target_size = 6;           // sum(counts)
-
-    // return array column: [["abc","d"],["abc","d"],["ef"],[""],[""],[""]];
-    auto res1 = array_column.clone_empty();
-    array_column.replicate(counts, target_size, *res1);
-    check_array_offsets(*res1, {2, 4, 5, 6, 7, 8});
-    check_array_data<std::string>(*res1, {"abc", "d", "abc", "d", "ef", "", "", ""});
 }
 
 } // namespace doris::vectorized

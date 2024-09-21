@@ -46,6 +46,10 @@ import java.util.stream.Collectors;
 public abstract class Resource implements Writable, GsonPostProcessable {
     private static final Logger LOG = LogManager.getLogger(OdbcCatalogResource.class);
     public static final String REFERENCE_SPLIT = "@";
+    public static final String INCLUDE_DATABASE_LIST = "include_database_list";
+    public static final String EXCLUDE_DATABASE_LIST = "exclude_database_list";
+    public static final String LOWER_CASE_META_NAMES = "lower_case_meta_names";
+    public static final String META_NAMES_MAPPING = "meta_names_mapping";
 
     public enum ResourceType {
         UNKNOWN,
@@ -55,7 +59,8 @@ public abstract class Resource implements Writable, GsonPostProcessable {
         JDBC,
         HDFS,
         HMS,
-        ES;
+        ES,
+        AZURE;
 
         public static ResourceType fromString(String resourceType) {
             for (ResourceType type : ResourceType.values()) {
@@ -107,6 +112,9 @@ public abstract class Resource implements Writable, GsonPostProcessable {
         lock.readLock().unlock();
     }
 
+    // https://programmerr47.medium.com/gson-unsafe-problem-d1ff29d4696f
+    // Resource subclass also MUST define default ctor, otherwise when reloading object from json
+    // some not serialized field (i.e. `lock`) will be `null`.
     public Resource() {
     }
 
@@ -170,6 +178,9 @@ public abstract class Resource implements Writable, GsonPostProcessable {
             case S3:
                 resource = new S3Resource(name);
                 break;
+            case AZURE:
+                resource = new AzureResource(name);
+                break;
             case JDBC:
                 resource = new JdbcResource(name);
                 break;
@@ -203,7 +214,7 @@ public abstract class Resource implements Writable, GsonPostProcessable {
      * @throws DdlException
      */
     public void modifyProperties(Map<String, String> properties) throws DdlException {
-        notifyUpdate();
+        notifyUpdate(properties);
     }
 
     /**
@@ -274,7 +285,7 @@ public abstract class Resource implements Writable, GsonPostProcessable {
         return copied;
     }
 
-    private void notifyUpdate() {
+    private void notifyUpdate(Map<String, String> properties) {
         references.entrySet().stream().collect(Collectors.groupingBy(Entry::getValue)).forEach((type, refs) -> {
             if (type == ReferenceType.CATALOG) {
                 for (Map.Entry<String, ReferenceType> ref : refs) {
@@ -289,9 +300,11 @@ public abstract class Resource implements Writable, GsonPostProcessable {
                                 + "names(resource={}, catalog.resource={})", catalogName, name, catalog.getResource());
                         continue;
                     }
-                    catalog.notifyPropertiesUpdated();
+                    catalog.notifyPropertiesUpdated(properties);
                 }
             }
         });
     }
+
+    public void applyDefaultProperties() {}
 }

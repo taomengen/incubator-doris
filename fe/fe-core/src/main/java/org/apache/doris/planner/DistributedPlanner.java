@@ -124,7 +124,7 @@ public class DistributedPlanner {
         boolean needRepartition = false;
         boolean needMerge = false;
         if (isFragmentPartitioned(inputFragment)) {
-            if (targetTable.isPartitioned()) {
+            if (targetTable.isPartitionDistributed()) {
                 if (stmt.getDataPartition().getType() == TPartitionType.RANDOM) {
                     return inputFragment;
                 }
@@ -137,7 +137,7 @@ public class DistributedPlanner {
                 needMerge = true;
             }
         } else {
-            if (targetTable.isPartitioned()) {
+            if (targetTable.isPartitionDistributed()) {
                 if (isRepart != null && isRepart) {
                     needRepartition = true;
                 } else {
@@ -278,12 +278,8 @@ public class DistributedPlanner {
      * TODO: hbase scans are range-partitioned on the row key
      */
     private PlanFragment createScanFragment(PlanNode node) throws UserException {
-        if (node instanceof MysqlScanNode || node instanceof OdbcScanNode || node instanceof JdbcScanNode) {
+        if (node instanceof MysqlScanNode) {
             return new PlanFragment(ctx.getNextFragmentId(), node, DataPartition.UNPARTITIONED);
-        } else if (node instanceof SchemaScanNode) {
-            return new PlanFragment(ctx.getNextFragmentId(), node, DataPartition.RANDOM);
-        } else if (node instanceof DataGenScanNode) {
-            return new PlanFragment(ctx.getNextFragmentId(), node, DataPartition.RANDOM);
         } else if (node instanceof OlapScanNode) {
             // olap scan node
             OlapScanNode olapScanNode = (OlapScanNode) node;
@@ -385,7 +381,7 @@ public class DistributedPlanner {
             node.setChild(0, leftChildFragment.getPlanRoot());
             connectChildFragment(node, 1, leftChildFragment, rightChildFragment);
             leftChildFragment.setPlanRoot(node);
-            rightChildFragment.setRightChildOfBroadcastHashJoin(true);
+            ((ExchangeNode) node.getChild(1)).setRightChildOfBroadcastHashJoin(true);
             return leftChildFragment;
         } else {
             node.setDistributionMode(HashJoinNode.DistributionMode.PARTITIONED);
@@ -592,7 +588,7 @@ public class DistributedPlanner {
                 }
             }
 
-            //3 the join columns should contains all distribute columns to enable colocate join
+            //3 the join columns should contain all distribute columns to enable colocate join
             if (leftJoinColumns.containsAll(leftDistributeColumns)
                     && rightJoinColumns.containsAll(rightDistributeColumns)) {
                 return true;
@@ -654,10 +650,11 @@ public class DistributedPlanner {
         DistributionInfo leftDistribution = leftScanNode.getOlapTable().getDefaultDistributionInfo();
 
         if (leftDistribution instanceof HashDistributionInfo) {
-            // use the table_name + '-' + column_name as check condition
+            // use the table_name + '-' + column_name.toLowerCase() as check condition,
+            // as column name in doris is case insensitive and table name is case sensitive
             List<Column> leftDistributeColumns = ((HashDistributionInfo) leftDistribution).getDistributionColumns();
             List<String> leftDistributeColumnNames = leftDistributeColumns.stream()
-                    .map(col -> leftTable.getName() + "." + col.getName()).collect(Collectors.toList());
+                    .map(col -> leftTable.getName() + "." + col.getName().toLowerCase()).collect(Collectors.toList());
 
             List<String> leftJoinColumnNames = new ArrayList<>();
             List<Expr> rightExprs = new ArrayList<>();
@@ -675,7 +672,8 @@ public class DistributedPlanner {
                         && leftScanNode.desc.getSlots().contains(leftSlot.getDesc())) {
                     // table name in SlotRef is not the really name. `select * from test as t`
                     // table name in SlotRef is `t`, but here we need is `test`.
-                    leftJoinColumnNames.add(leftSlot.getTable().getName() + "." + leftSlot.getColumnName());
+                    leftJoinColumnNames.add(leftSlot.getTable().getName() + "."
+                            + leftSlot.getColumnName().toLowerCase());
                     rightExprs.add(rhsJoinExpr);
                 }
             }
@@ -688,7 +686,11 @@ public class DistributedPlanner {
                 // check the rhs join expr type is same as distribute column
                 for (int j = 0; j < leftJoinColumnNames.size(); j++) {
                     if (leftJoinColumnNames.get(j).equals(distributeColumnName)) {
-                        if (rightExprs.get(j).getType().equals(leftDistributeColumns.get(i).getType())) {
+                        // varchar and string type don't need to check the length property
+                        if ((rightExprs.get(j).getType().isVarcharOrStringType()
+                                && leftDistributeColumns.get(i).getType().isVarcharOrStringType())
+                                || (rightExprs.get(j).getType()
+                                        .equals(leftDistributeColumns.get(i).getType()))) {
                             rhsJoinExprs.add(rightExprs.get(j));
                             findRhsExprs = true;
                             break;
@@ -943,8 +945,10 @@ public class DistributedPlanner {
     private boolean canColocateAgg(AggregateInfo aggregateInfo, DataPartition childFragmentDataPartition) {
         // Condition1
         if (ConnectContext.get().getSessionVariable().isDisableColocatePlan()) {
-            LOG.debug("Agg node is not colocate in:" + ConnectContext.get().queryId()
-                    + ", reason:" + DistributedPlanColocateRule.SESSION_DISABLED);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Agg node is not colocate in:" + ConnectContext.get().queryId()
+                        + ", reason:" + DistributedPlanColocateRule.SESSION_DISABLED);
+            }
             return false;
         }
 
@@ -1298,6 +1302,7 @@ public class DistributedPlanner {
             exchNode.setLimit(limit);
         }
         exchNode.setMergeInfo(node.getSortInfo());
+        node.setMergeByExchange();
         exchNode.setOffset(offset);
 
         // Child nodes should not process the offset. If there is a limit,

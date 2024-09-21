@@ -18,13 +18,17 @@
 #ifndef DORIS_BE_SRC_TESTUTIL_DESC_TBL_BUILDER_H
 #define DORIS_BE_SRC_TESTUTIL_DESC_TBL_BUILDER_H
 
-#include "runtime/runtime_state.h"
+#include <gen_cpp/Descriptors_types.h>
+
+#include <vector>
+
 #include "runtime/types.h"
 
 namespace doris {
 
 class ObjectPool;
 class TupleDescBuilder;
+class DescriptorTbl;
 
 // Aids in the construction of a DescriptorTbl by declaring tuples and slots
 // associated with those tuples.
@@ -48,7 +52,7 @@ public:
 
 private:
     // Owned by caller.
-    ObjectPool* _obj_pool;
+    ObjectPool* _obj_pool = nullptr;
 
     std::vector<TupleDescBuilder*> _tuples_descs;
 

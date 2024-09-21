@@ -17,8 +17,6 @@
 
 #pragma once
 
-#include <parallel_hashmap/phmap.h>
-
 #include <cstdint>
 #include <roaring/roaring.hh>
 
@@ -27,6 +25,7 @@
 #include "olap/column_predicate.h"
 #include "olap/olap_common.h"
 #include "olap/rowset/segment_v2/bloom_filter.h"
+#include "olap/rowset/segment_v2/inverted_index_cache.h" // IWYU pragma: keep
 #include "olap/rowset/segment_v2/inverted_index_reader.h"
 #include "olap/wrapper_field.h"
 #include "runtime/define_primitive_type.h"
@@ -37,26 +36,6 @@
 #include "vec/common/string_ref.h"
 #include "vec/core/types.h"
 
-template <>
-struct std::equal_to<doris::StringRef> {
-    bool operator()(const doris::StringRef& lhs, const doris::StringRef& rhs) const {
-        return lhs == rhs;
-    }
-};
-// for decimal12_t
-template <>
-struct std::hash<doris::decimal12_t> {
-    int64_t operator()(const doris::decimal12_t& rhs) const {
-        return hash<int64_t>()(rhs.integer) ^ hash<int32_t>()(rhs.fraction);
-    }
-};
-
-template <>
-struct std::equal_to<doris::decimal12_t> {
-    bool operator()(const doris::decimal12_t& lhs, const doris::decimal12_t& rhs) const {
-        return lhs == rhs;
-    }
-};
 // for uint24_t
 template <>
 struct std::hash<doris::uint24_t> {
@@ -75,29 +54,35 @@ struct std::equal_to<doris::uint24_t> {
 
 namespace doris {
 
-template <PrimitiveType Type, PredicateType PT>
+/**
+ * Use HybridSetType can avoid virtual function call in the loop.
+ * @tparam Type
+ * @tparam PT
+ * @tparam HybridSetType
+ */
+template <PrimitiveType Type, PredicateType PT, typename HybridSetType>
 class InListPredicateBase : public ColumnPredicate {
 public:
-    using T = typename PredicatePrimitiveTypeTraits<Type>::PredicateFieldType;
+    using T = typename PrimitiveTypeTraits<Type>::CppType;
     template <typename ConditionType, typename ConvertFunc>
     InListPredicateBase(uint32_t column_id, const ConditionType& conditions,
                         const ConvertFunc& convert, bool is_opposite = false,
-                        const TabletColumn* col = nullptr, MemPool* pool = nullptr)
+                        const TabletColumn* col = nullptr, vectorized::Arena* arena = nullptr)
             : ColumnPredicate(column_id, is_opposite),
-              _values(new phmap::flat_hash_set<T>()),
               _min_value(type_limit<T>::max()),
               _max_value(type_limit<T>::min()) {
+        _values = std::make_shared<HybridSetType>();
         for (const auto& condition : conditions) {
             T tmp;
             if constexpr (Type == TYPE_STRING || Type == TYPE_CHAR) {
-                tmp = convert(*col, condition, pool);
+                tmp = convert(*col, condition, arena);
             } else if constexpr (Type == TYPE_DECIMAL32 || Type == TYPE_DECIMAL64 ||
-                                 Type == TYPE_DECIMAL128I) {
+                                 Type == TYPE_DECIMAL128I || Type == TYPE_DECIMAL256) {
                 tmp = convert(*col, condition);
             } else {
                 tmp = convert(condition);
             }
-            _values->insert(tmp);
+            _values->insert(&tmp);
             _update_min_max(tmp);
         }
     }
@@ -107,60 +92,52 @@ public:
             : ColumnPredicate(column_id, false),
               _min_value(type_limit<T>::max()),
               _max_value(type_limit<T>::min()) {
-        using HybridSetType = std::conditional_t<is_string_type(Type), StringSet, HybridSet<Type>>;
-
         CHECK(hybrid_set != nullptr);
 
         if constexpr (is_string_type(Type) || Type == TYPE_DECIMALV2 || is_date_type(Type)) {
-            _values = new phmap::flat_hash_set<T>();
-            auto values = ((HybridSetType*)hybrid_set.get())->get_inner_set();
-
+            _values = std::make_shared<HybridSetType>();
             if constexpr (is_string_type(Type)) {
-                // values' type is "phmap::flat_hash_set<std::string>"
-                for (const std::string& value : *values) {
-                    StringRef sv = value;
+                HybridSetBase::IteratorBase* iter = hybrid_set->begin();
+                while (iter->has_next()) {
+                    const StringRef* value = (const StringRef*)(iter->get_value());
                     if constexpr (Type == TYPE_CHAR) {
                         _temp_datas.push_back("");
-                        _temp_datas.back().resize(std::max(char_length, value.size()));
-                        memcpy(_temp_datas.back().data(), value.data(), value.size());
-                        sv = _temp_datas.back();
+                        _temp_datas.back().resize(std::max(char_length, value->size));
+                        memcpy(_temp_datas.back().data(), value->data, value->size);
+                        const string& str = _temp_datas.back();
+                        _values->insert((void*)str.data(), str.length());
+                    } else {
+                        _values->insert((void*)value->data, value->size);
                     }
-                    _values->insert(sv);
-                }
-            } else if constexpr (Type == TYPE_DECIMALV2) {
-                for (auto& value : *values) {
-                    _values->insert({value.int_value(), value.frac_value()});
-                }
-            } else if constexpr (Type == TYPE_DATE) {
-                for (auto& value : *values) {
-                    _values->insert(value.to_olap_date());
-                }
-            } else if constexpr (Type == TYPE_DATETIME) {
-                for (auto& value : *values) {
-                    _values->insert(value.to_olap_datetime());
+                    iter->next();
                 }
             } else {
-                CHECK(Type == TYPE_DATETIMEV2 || Type == TYPE_DATEV2);
-                for (auto& value : *values) {
-                    _values->insert(T(value));
+                HybridSetBase::IteratorBase* iter = hybrid_set->begin();
+                while (iter->has_next()) {
+                    const void* value = iter->get_value();
+                    _values->insert(value);
+                    iter->next();
                 }
             }
         } else {
-            _values = ((HybridSetType*)hybrid_set.get())->get_inner_set();
+            // shared from the caller, so it needs to be shared ptr
+            _values = hybrid_set;
         }
-
-        for (auto& value : *_values) {
-            _update_min_max(value);
-        }
-    }
-
-    ~InListPredicateBase() override {
-        if constexpr (is_string_type(Type) || Type == TYPE_DECIMALV2 || is_date_type(Type)) {
-            delete _values;
+        HybridSetBase::IteratorBase* iter = _values->begin();
+        while (iter->has_next()) {
+            const T* value = (const T*)(iter->get_value());
+            _update_min_max(*value);
+            iter->next();
         }
     }
+
+    ~InListPredicateBase() override = default;
 
     PredicateType type() const override { return PT; }
+
+    bool can_do_apply_safely(PrimitiveType input_type, bool is_null) const override {
+        return input_type == Type || (is_string_type(input_type) && is_string_type(Type));
+    }
 
     Status evaluate(BitmapIndexIterator* iterator, uint32_t num_rows,
                     roaring::Roaring* result) const override {
@@ -173,13 +150,17 @@ public:
             *result -= null_bitmap;
         }
         roaring::Roaring indices;
-        for (auto value : *_values) {
+        HybridSetBase::IteratorBase* iter = _values->begin();
+        while (iter->has_next()) {
+            const void* value = iter->get_value();
             bool exact_match;
-            Status s = iterator->seek_dictionary(&value, &exact_match);
+            auto&& value_ = PrimitiveTypeConvertor<Type>::to_storage_field_type(
+                    *reinterpret_cast<const T*>(value));
+            Status status = iterator->seek_dictionary(&value_, &exact_match);
             rowid_t seeked_ordinal = iterator->current_ordinal();
-            if (!s.is<ErrorCode::NOT_FOUND>()) {
-                if (!s.ok()) {
-                    return s;
+            if (!status.is<ErrorCode::ENTRY_NOT_FOUND>()) {
+                if (!status.ok()) {
+                    return status;
                 }
                 if (exact_match) {
                     roaring::Roaring index;
@@ -187,6 +168,7 @@ public:
                     indices |= index;
                 }
             }
+            iter->next();
         }
 
         if constexpr (PT == PredicateType::IN_LIST) {
@@ -198,21 +180,42 @@ public:
         return Status::OK();
     }
 
-    Status evaluate(const Schema& schema, InvertedIndexIterator* iterator, uint32_t num_rows,
+    Status evaluate(const vectorized::IndexFieldNameAndTypePair& name_with_type,
+                    InvertedIndexIterator* iterator, uint32_t num_rows,
                     roaring::Roaring* result) const override {
         if (iterator == nullptr) {
             return Status::OK();
         }
-        auto column_desc = schema.column(_column_id);
-        std::string column_name = column_desc->name();
+        std::string column_name = name_with_type.first;
         roaring::Roaring indices;
-        for (auto value : *_values) {
+        HybridSetBase::IteratorBase* iter = _values->begin();
+        while (iter->has_next()) {
+            const void* ptr = iter->get_value();
+            //            auto&& value = PrimitiveTypeConvertor<Type>::to_storage_field_type(
+            //                    *reinterpret_cast<const T*>(ptr));
+            std::unique_ptr<InvertedIndexQueryParamFactory> query_param = nullptr;
+            RETURN_IF_ERROR(
+                    InvertedIndexQueryParamFactory::create_query_value<Type>(ptr, query_param));
             InvertedIndexQueryType query_type = InvertedIndexQueryType::EQUAL_QUERY;
-            roaring::Roaring index;
-            RETURN_IF_ERROR(iterator->read_from_inverted_index(column_name, &value, query_type,
-                                                               num_rows, &index));
-            indices |= index;
+            std::shared_ptr<roaring::Roaring> index = std::make_shared<roaring::Roaring>();
+            RETURN_IF_ERROR(iterator->read_from_inverted_index(
+                    column_name, query_param->get_value(), query_type, num_rows, index));
+            indices |= *index;
+            iter->next();
         }
+
+        // mask out null_bitmap, since NULL cmp VALUE will produce NULL
+        //  and be treated as false in WHERE
+        // keep it after query, since query will try to read null_bitmap and put it to cache
+        if (iterator->has_null()) {
+            InvertedIndexQueryCacheHandle null_bitmap_cache_handle;
+            RETURN_IF_ERROR(iterator->read_null_bitmap(&null_bitmap_cache_handle));
+            std::shared_ptr<roaring::Roaring> null_bitmap = null_bitmap_cache_handle.get_bitmap();
+            if (null_bitmap) {
+                *result -= *null_bitmap;
+            }
+        }
+
         if constexpr (PT == PredicateType::IN_LIST) {
             *result &= indices;
         } else {
@@ -221,29 +224,8 @@ public:
         return Status::OK();
     }
 
-    uint16_t evaluate(const vectorized::IColumn& column, uint16_t* sel,
-                      uint16_t size) const override {
-        if (column.is_nullable()) {
-            auto* nullable_col =
-                    vectorized::check_and_get_column<vectorized::ColumnNullable>(column);
-            auto& null_bitmap = reinterpret_cast<const vectorized::ColumnUInt8&>(
-                                        nullable_col->get_null_map_column())
-                                        .get_data();
-            auto& nested_col = nullable_col->get_nested_column();
-
-            if (_opposite) {
-                return _base_evaluate<true, true>(&nested_col, &null_bitmap, sel, size);
-            } else {
-                return _base_evaluate<true, false>(&nested_col, &null_bitmap, sel, size);
-            }
-        } else {
-            if (_opposite) {
-                return _base_evaluate<false, true>(&column, nullptr, sel, size);
-            } else {
-                return _base_evaluate<false, false>(&column, nullptr, sel, size);
-            }
-        }
-    }
+    int get_filter_id() const override { return _values->get_filter_id(); }
+    bool is_filter() const override { return true; }
 
     template <bool is_and>
     void _evaluate_bit(const vectorized::IColumn& column, const uint16_t* sel, uint16_t size,
@@ -287,21 +269,22 @@ public:
             return true;
         }
         if constexpr (PT == PredicateType::IN_LIST) {
-            if constexpr (Type == TYPE_DATE) {
-                T tmp_min_uint32_value = 0;
-                memcpy((char*)(&tmp_min_uint32_value), statistic.first->cell_ptr(),
-                       sizeof(uint24_t));
-                T tmp_max_uint32_value = 0;
-                memcpy((char*)(&tmp_max_uint32_value), statistic.second->cell_ptr(),
-                       sizeof(uint24_t));
-                return tmp_min_uint32_value <= _max_value && tmp_max_uint32_value >= _min_value;
-            } else {
-                return _get_zone_map_value<T>(statistic.first->cell_ptr()) <= _max_value &&
-                       _get_zone_map_value<T>(statistic.second->cell_ptr()) >= _min_value;
-            }
+            return get_zone_map_value<Type, T>(statistic.first->cell_ptr()) <= _max_value &&
+                   get_zone_map_value<Type, T>(statistic.second->cell_ptr()) >= _min_value;
         } else {
             return true;
         }
+    }
+
+    bool evaluate_and(const StringRef* dict_words, const size_t count) const override {
+        for (size_t i = 0; i != count; ++i) {
+            const auto found = _values->find(dict_words[i].data, dict_words[i].size) ^ _opposite;
+            if (found == (PT == PredicateType::IN_LIST)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     bool evaluate_del(const std::pair<WrapperField*, WrapperField*>& statistic) const override {
@@ -309,18 +292,8 @@ public:
             return false;
         }
         if constexpr (PT == PredicateType::NOT_IN_LIST) {
-            if constexpr (Type == TYPE_DATE) {
-                T tmp_min_uint32_value = 0;
-                memcpy((char*)(&tmp_min_uint32_value), statistic.first->cell_ptr(),
-                       sizeof(uint24_t));
-                T tmp_max_uint32_value = 0;
-                memcpy((char*)(&tmp_max_uint32_value), statistic.second->cell_ptr(),
-                       sizeof(uint24_t));
-                return tmp_min_uint32_value > _max_value || tmp_max_uint32_value < _min_value;
-            } else {
-                return _get_zone_map_value<T>(statistic.first->cell_ptr()) > _max_value ||
-                       _get_zone_map_value<T>(statistic.second->cell_ptr()) < _min_value;
-            }
+            return get_zone_map_value<Type, T>(statistic.first->cell_ptr()) > _max_value ||
+                   get_zone_map_value<Type, T>(statistic.second->cell_ptr()) < _min_value;
         } else {
             return false;
         }
@@ -328,20 +301,33 @@ public:
 
     bool evaluate_and(const segment_v2::BloomFilter* bf) const override {
         if constexpr (PT == PredicateType::IN_LIST) {
-            for (auto value : *_values) {
+            // IN predicate can not use ngram bf, just return true to accept
+            if (bf->is_ngram_bf()) return true;
+            HybridSetBase::IteratorBase* iter = _values->begin();
+            while (iter->has_next()) {
                 if constexpr (std::is_same_v<T, StringRef>) {
-                    if (bf->test_bytes(value.data, value.size)) {
+                    const StringRef* value = (const StringRef*)iter->get_value();
+                    if (bf->test_bytes(value->data, value->size)) {
                         return true;
                     }
-                } else if constexpr (Type == TYPE_DATE) {
-                    if (bf->test_bytes(reinterpret_cast<char*>(&value), sizeof(uint24_t))) {
+                } else if constexpr (Type == PrimitiveType::TYPE_DECIMALV2) {
+                    // DecimalV2 using decimal12_t in bloom filter in storage layer,
+                    // should convert value to decimal12_t
+                    // Datev1/DatetimeV1 using VecDatetimeValue in bloom filter, NO need to convert.
+                    const T* value = (const T*)(iter->get_value());
+                    decimal12_t decimal12_t_val(value->int_value(), value->frac_value());
+                    if (bf->test_bytes(
+                                const_cast<char*>(reinterpret_cast<const char*>(&decimal12_t_val)),
+                                sizeof(decimal12_t))) {
                         return true;
                     }
                 } else {
-                    if (bf->test_bytes(reinterpret_cast<char*>(&value), sizeof(value))) {
+                    const T* value = (const T*)(iter->get_value());
+                    if (bf->test_bytes(reinterpret_cast<const char*>(value), sizeof(*value))) {
                         return true;
                     }
                 }
+                iter->next();
             }
             return false;
         } else {
@@ -350,18 +336,53 @@ public:
         }
     }
 
-    bool can_do_bloom_filter() const override { return PT == PredicateType::IN_LIST; }
+    bool can_do_bloom_filter(bool ngram) const override {
+        return PT == PredicateType::IN_LIST && !ngram;
+    }
+
+    double get_ignore_threshold() const override {
+        return get_in_list_ignore_thredhold(_values->size());
+    }
 
 private:
+    bool _can_ignore() const override { return _values->is_runtime_filter(); }
+
+    uint16_t _evaluate_inner(const vectorized::IColumn& column, uint16_t* sel,
+                             uint16_t size) const override {
+        int64_t new_size = 0;
+
+        if (column.is_nullable()) {
+            const auto* nullable_col =
+                    vectorized::check_and_get_column<vectorized::ColumnNullable>(column);
+            const auto& null_map = reinterpret_cast<const vectorized::ColumnUInt8&>(
+                                           nullable_col->get_null_map_column())
+                                           .get_data();
+            const auto& nested_col = nullable_col->get_nested_column();
+
+            if (_opposite) {
+                new_size = _base_evaluate<true, true>(&nested_col, &null_map, sel, size);
+            } else {
+                new_size = _base_evaluate<true, false>(&nested_col, &null_map, sel, size);
+            }
+        } else {
+            if (_opposite) {
+                new_size = _base_evaluate<false, true>(&column, nullptr, sel, size);
+            } else {
+                new_size = _base_evaluate<false, false>(&column, nullptr, sel, size);
+            }
+        }
+        _evaluated_rows += size;
+        _passed_rows += new_size;
+        return new_size;
+    }
+
     template <typename LeftT, typename RightT>
     bool _operator(const LeftT& lhs, const RightT& rhs) const {
-        if constexpr (Type == TYPE_BOOLEAN) {
-            DCHECK(_values->size() == 2);
-            return PT == PredicateType::IN_LIST;
-        } else if constexpr (PT == PredicateType::IN_LIST) {
+        if constexpr (PT == PredicateType::IN_LIST) {
             return lhs != rhs;
+        } else {
+            return lhs == rhs;
         }
-        return lhs == rhs;
     }
 
     template <bool is_nullable, bool is_opposite>
@@ -379,7 +400,7 @@ private:
                 DCHECK((segid.first.hi | segid.first.mi | segid.first.lo) != 0);
                 auto& value_in_dict_flags = _segment_id_to_value_in_dict_flags[segid];
                 if (value_in_dict_flags.empty()) {
-                    nested_col_ptr->find_codes(*_values, value_in_dict_flags);
+                    nested_col_ptr->find_codes(_values.get(), value_in_dict_flags);
                 }
 
                 CHECK(value_in_dict_flags.size() == nested_col_ptr->dict_size())
@@ -411,37 +432,25 @@ private:
                 }
             } else {
                 LOG(FATAL) << "column_dictionary must use StringRef predicate.";
+                __builtin_unreachable();
             }
         } else {
-            auto* nested_col_ptr = vectorized::check_and_get_column<
-                    vectorized::PredicateColumnType<PredicateEvaluateType<Type>>>(column);
-            auto& data_array = nested_col_ptr->get_data();
+            auto& pred_col =
+                    vectorized::check_and_get_column<
+                            vectorized::PredicateColumnType<PredicateEvaluateType<Type>>>(column)
+                            ->get_data();
+            auto pred_col_data = pred_col.data();
 
-            for (uint16_t i = 0; i < size; i++) {
-                uint16_t idx = sel[i];
-                if constexpr (is_nullable) {
-                    if ((*null_map)[idx]) {
-                        if constexpr (is_opposite) {
-                            sel[new_size++] = idx;
-                        }
-                        continue;
-                    }
-                }
-
-                if constexpr (!is_opposite) {
-                    if (_operator(_values->find(reinterpret_cast<const T&>(data_array[idx])),
-                                  _values->end())) {
-                        sel[new_size++] = idx;
-                    }
-                } else {
-                    if (!_operator(_values->find(reinterpret_cast<const T&>(data_array[idx])),
-                                   _values->end())) {
-                        sel[new_size++] = idx;
-                    }
-                }
-            }
+#define EVALUATE_WITH_NULL_IMPL(IDX) \
+    is_opposite ^                    \
+            (!(*null_map)[IDX] &&    \
+             _operator(_values->find(reinterpret_cast<const T*>(&pred_col_data[IDX])), false))
+#define EVALUATE_WITHOUT_NULL_IMPL(IDX) \
+    is_opposite ^ _operator(_values->find(reinterpret_cast<const T*>(&pred_col_data[IDX])), false)
+            EVALUATE_BY_SELECTOR(EVALUATE_WITH_NULL_IMPL, EVALUATE_WITHOUT_NULL_IMPL)
+#undef EVALUATE_WITH_NULL_IMPL
+#undef EVALUATE_WITHOUT_NULL_IMPL
         }
-
         return new_size;
     }
 
@@ -457,7 +466,7 @@ private:
                 auto& value_in_dict_flags =
                         _segment_id_to_value_in_dict_flags[column->get_rowset_segment_id()];
                 if (value_in_dict_flags.empty()) {
-                    nested_col_ptr->find_codes(*_values, value_in_dict_flags);
+                    nested_col_ptr->find_codes(_values.get(), value_in_dict_flags);
                 }
 
                 for (uint16_t i = 0; i < size; i++) {
@@ -487,6 +496,7 @@ private:
                 }
             } else {
                 LOG(FATAL) << "column_dictionary must use StringRef predicate.";
+                __builtin_unreachable();
             }
         } else {
             auto* nested_col_ptr = vectorized::check_and_get_column<
@@ -509,14 +519,14 @@ private:
 
                 if constexpr (!is_opposite) {
                     if (is_and ^
-                        _operator(_values->find(reinterpret_cast<const T&>(data_array[idx])),
-                                  _values->end())) {
+                        _operator(_values->find(reinterpret_cast<const T*>(&data_array[idx])),
+                                  false)) {
                         flags[i] = !is_and;
                     }
                 } else {
                     if (is_and ^
-                        !_operator(_values->find(reinterpret_cast<const T&>(data_array[idx])),
-                                   _values->end())) {
+                        !_operator(_values->find(reinterpret_cast<const T*>(&data_array[idx])),
+                                   false)) {
                         flags[i] = !is_and;
                     }
                 }
@@ -539,7 +549,7 @@ private:
         }
     }
 
-    phmap::flat_hash_set<T>* _values;
+    std::shared_ptr<HybridSetBase> _values;
     mutable std::map<std::pair<RowsetId, uint32_t>, std::vector<vectorized::UInt8>>
             _segment_id_to_value_in_dict_flags;
     T _min_value;
@@ -548,5 +558,111 @@ private:
     // temp string for char type column
     std::list<std::string> _temp_datas;
 };
+
+template <PrimitiveType Type, PredicateType PT, typename ConditionType, typename ConvertFunc,
+          size_t N = 0>
+ColumnPredicate* _create_in_list_predicate(uint32_t column_id, const ConditionType& conditions,
+                                           const ConvertFunc& convert, bool is_opposite = false,
+                                           const TabletColumn* col = nullptr,
+                                           vectorized::Arena* arena = nullptr) {
+    using T = typename PrimitiveTypeTraits<Type>::CppType;
+    if constexpr (N >= 1 && N <= FIXED_CONTAINER_MAX_SIZE) {
+        using Set = std::conditional_t<
+                std::is_same_v<T, StringRef>, StringSet<FixedContainer<std::string, N>>,
+                HybridSet<Type, FixedContainer<T, N>,
+                          vectorized::PredicateColumnType<PredicateEvaluateType<Type>>>>;
+        return new InListPredicateBase<Type, PT, Set>(column_id, conditions, convert, is_opposite,
+                                                      col, arena);
+    } else {
+        using Set = std::conditional_t<
+                std::is_same_v<T, StringRef>, StringSet<DynamicContainer<std::string>>,
+                HybridSet<Type, DynamicContainer<T>,
+                          vectorized::PredicateColumnType<PredicateEvaluateType<Type>>>>;
+        return new InListPredicateBase<Type, PT, Set>(column_id, conditions, convert, is_opposite,
+                                                      col, arena);
+    }
+}
+
+template <PrimitiveType Type, PredicateType PT, typename ConditionType, typename ConvertFunc>
+ColumnPredicate* create_in_list_predicate(uint32_t column_id, const ConditionType& conditions,
+                                          const ConvertFunc& convert, bool is_opposite = false,
+                                          const TabletColumn* col = nullptr,
+                                          vectorized::Arena* arena = nullptr) {
+    if (conditions.size() == 1) {
+        return _create_in_list_predicate<Type, PT, ConditionType, ConvertFunc, 1>(
+                column_id, conditions, convert, is_opposite, col, arena);
+    } else if (conditions.size() == 2) {
+        return _create_in_list_predicate<Type, PT, ConditionType, ConvertFunc, 2>(
+                column_id, conditions, convert, is_opposite, col, arena);
+    } else if (conditions.size() == 3) {
+        return _create_in_list_predicate<Type, PT, ConditionType, ConvertFunc, 3>(
+                column_id, conditions, convert, is_opposite, col, arena);
+    } else if (conditions.size() == 4) {
+        return _create_in_list_predicate<Type, PT, ConditionType, ConvertFunc, 4>(
+                column_id, conditions, convert, is_opposite, col, arena);
+    } else if (conditions.size() == 5) {
+        return _create_in_list_predicate<Type, PT, ConditionType, ConvertFunc, 5>(
+                column_id, conditions, convert, is_opposite, col, arena);
+    } else if (conditions.size() == 6) {
+        return _create_in_list_predicate<Type, PT, ConditionType, ConvertFunc, 6>(
+                column_id, conditions, convert, is_opposite, col, arena);
+    } else if (conditions.size() == 7) {
+        return _create_in_list_predicate<Type, PT, ConditionType, ConvertFunc, 7>(
+                column_id, conditions, convert, is_opposite, col, arena);
+    } else if (conditions.size() == FIXED_CONTAINER_MAX_SIZE) {
+        return _create_in_list_predicate<Type, PT, ConditionType, ConvertFunc,
+                                         FIXED_CONTAINER_MAX_SIZE>(column_id, conditions, convert,
+                                                                   is_opposite, col, arena);
+    } else {
+        return _create_in_list_predicate<Type, PT, ConditionType, ConvertFunc>(
+                column_id, conditions, convert, is_opposite, col, arena);
+    }
+}
+
+template <PrimitiveType Type, PredicateType PT, size_t N = 0>
+ColumnPredicate* _create_in_list_predicate(uint32_t column_id,
+                                           const std::shared_ptr<HybridSetBase>& hybrid_set,
+                                           size_t char_length = 0) {
+    using T = typename PrimitiveTypeTraits<Type>::CppType;
+    if constexpr (N >= 1 && N <= FIXED_CONTAINER_MAX_SIZE) {
+        using Set = std::conditional_t<
+                std::is_same_v<T, StringRef>, StringSet<FixedContainer<std::string, N>>,
+                HybridSet<Type, FixedContainer<T, N>,
+                          vectorized::PredicateColumnType<PredicateEvaluateType<Type>>>>;
+        return new InListPredicateBase<Type, PT, Set>(column_id, hybrid_set, char_length);
+    } else {
+        using Set = std::conditional_t<
+                std::is_same_v<T, StringRef>, StringSet<DynamicContainer<std::string>>,
+                HybridSet<Type, DynamicContainer<T>,
+                          vectorized::PredicateColumnType<PredicateEvaluateType<Type>>>>;
+        return new InListPredicateBase<Type, PT, Set>(column_id, hybrid_set, char_length);
+    }
+}
+
+template <PrimitiveType Type, PredicateType PT>
+ColumnPredicate* create_in_list_predicate(uint32_t column_id,
+                                          const std::shared_ptr<HybridSetBase>& hybrid_set,
+                                          size_t char_length = 0) {
+    if (hybrid_set->size() == 1) {
+        return _create_in_list_predicate<Type, PT, 1>(column_id, hybrid_set, char_length);
+    } else if (hybrid_set->size() == 2) {
+        return _create_in_list_predicate<Type, PT, 2>(column_id, hybrid_set, char_length);
+    } else if (hybrid_set->size() == 3) {
+        return _create_in_list_predicate<Type, PT, 3>(column_id, hybrid_set, char_length);
+    } else if (hybrid_set->size() == 4) {
+        return _create_in_list_predicate<Type, PT, 4>(column_id, hybrid_set, char_length);
+    } else if (hybrid_set->size() == 5) {
+        return _create_in_list_predicate<Type, PT, 5>(column_id, hybrid_set, char_length);
+    } else if (hybrid_set->size() == 6) {
+        return _create_in_list_predicate<Type, PT, 6>(column_id, hybrid_set, char_length);
+    } else if (hybrid_set->size() == 7) {
+        return _create_in_list_predicate<Type, PT, 7>(column_id, hybrid_set, char_length);
+    } else if (hybrid_set->size() == FIXED_CONTAINER_MAX_SIZE) {
+        return _create_in_list_predicate<Type, PT, FIXED_CONTAINER_MAX_SIZE>(column_id, hybrid_set,
+                                                                             char_length);
+    } else {
+        return _create_in_list_predicate<Type, PT>(column_id, hybrid_set, char_length);
+    }
+}
 
 } //namespace doris

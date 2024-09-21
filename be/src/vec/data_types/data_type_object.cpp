@@ -18,27 +18,45 @@
 // https://github.com/ClickHouse/ClickHouse/blob/master/src/DataTypes/DataTypeObject.cpp
 // and modified by Doris
 
-#include <util/string_util.h>
-#include <vec/data_types/data_type_object.h>
-#include <vec/io/io_helper.h>
+#include "vec/data_types/data_type_object.h"
 
-#include <vec/data_types/data_type_factory.hpp>
+#include <gen_cpp/data.pb.h>
+#include <string.h>
+#include <util/string_util.h>
+
+#include <cassert>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include "agent/be_exec_version_manager.h"
+#include "vec/columns/column_object.h"
+#include "vec/common/assert_cast.h"
+#include "vec/common/typeid_cast.h"
+#include "vec/data_types/data_type.h"
+#include "vec/data_types/data_type_factory.hpp"
+#include "vec/json/path_in_data.h"
+
+namespace doris {
+namespace vectorized {
+class IColumn;
+} // namespace vectorized
+} // namespace doris
 
 namespace doris::vectorized {
 
 DataTypeObject::DataTypeObject(const String& schema_format_, bool is_nullable_)
         : schema_format(to_lower(schema_format_)), is_nullable(is_nullable_) {}
 bool DataTypeObject::equals(const IDataType& rhs) const {
-    if (const auto* object = typeid_cast<const DataTypeObject*>(&rhs)) {
-        return schema_format == object->schema_format && is_nullable == object->is_nullable;
-    }
-    return false;
+    return typeid_cast<const DataTypeObject*>(&rhs) != nullptr;
 }
 
 int64_t DataTypeObject::get_uncompressed_serialized_bytes(const IColumn& column,
                                                           int be_exec_version) const {
     const auto& column_object = assert_cast<const ColumnObject&>(column);
-    assert(column_object.is_finalized());
+    if (!column_object.is_finalized()) {
+        const_cast<ColumnObject&>(column_object).finalize();
+    }
 
     const auto& subcolumns = column_object.get_subcolumns();
     size_t size = 0;
@@ -46,7 +64,9 @@ int64_t DataTypeObject::get_uncompressed_serialized_bytes(const IColumn& column,
     size += sizeof(uint32_t);
     for (const auto& entry : subcolumns) {
         auto type = entry->data.get_least_common_type();
-
+        if (is_nothing(type)) {
+            continue;
+        }
         PColumnMeta column_meta_pb;
         column_meta_pb.set_name(entry->path.get_path());
         type->to_pb_column_meta(&column_meta_pb);
@@ -58,25 +78,38 @@ int64_t DataTypeObject::get_uncompressed_serialized_bytes(const IColumn& column,
         size += type->get_uncompressed_serialized_bytes(entry->data.get_finalized_column(),
                                                         be_exec_version);
     }
+    // serialize num of rows, only take effect when subcolumns empty
+    if (be_exec_version >= VARIANT_SERDE) {
+        size += sizeof(uint32_t);
+    }
 
     return size;
 }
 
 char* DataTypeObject::serialize(const IColumn& column, char* buf, int be_exec_version) const {
     const auto& column_object = assert_cast<const ColumnObject&>(column);
-    assert(column_object.is_finalized());
+    if (!column_object.is_finalized()) {
+        const_cast<ColumnObject&>(column_object).finalize();
+    }
+#ifndef NDEBUG
+    // DCHECK size
+    column_object.check_consistency();
+#endif
 
     const auto& subcolumns = column_object.get_subcolumns();
 
-    // 1. serialize num of subcolumns
-    *reinterpret_cast<uint32_t*>(buf) = subcolumns.size();
+    char* size_pos = buf;
     buf += sizeof(uint32_t);
 
+    size_t num_of_columns = 0;
     // 2. serialize each subcolumn in a loop
     for (const auto& entry : subcolumns) {
         // 2.1 serialize subcolumn column meta pb (path and type)
         auto type = entry->data.get_least_common_type();
-
+        if (is_nothing(type)) {
+            continue;
+        }
+        ++num_of_columns;
         PColumnMeta column_meta_pb;
         column_meta_pb.set_name(entry->path.get_path());
         type->to_pb_column_meta(&column_meta_pb);
@@ -89,6 +122,13 @@ char* DataTypeObject::serialize(const IColumn& column, char* buf, int be_exec_ve
 
         // 2.2 serialize subcolumn
         buf = type->serialize(entry->data.get_finalized_column(), buf, be_exec_version);
+    }
+    // serialize num of subcolumns
+    *reinterpret_cast<uint32_t*>(size_pos) = num_of_columns;
+    // serialize num of rows, only take effect when subcolumns empty
+    if (be_exec_version >= VARIANT_SERDE) {
+        *reinterpret_cast<uint32_t*>(buf) = column_object.rows();
+        buf += sizeof(uint32_t);
     }
 
     return buf;
@@ -118,13 +158,38 @@ const char* DataTypeObject::deserialize(const char* buf, IColumn* column,
         buf = type->deserialize(buf, sub_column.get(), be_exec_version);
 
         // add subcolumn to column_object
-        PathInData key {column_meta_pb.name()};
-        column_object->add_sub_column(key, std::move(sub_column));
+        PathInData key;
+        if (!column_meta_pb.name().empty()) {
+            key = PathInData {column_meta_pb.name()};
+        }
+        column_object->add_sub_column(key, std::move(sub_column), type);
+    }
+    size_t num_rows = 0;
+    // serialize num of rows, only take effect when subcolumns empty
+    if (be_exec_version >= VARIANT_SERDE) {
+        num_rows = *reinterpret_cast<const uint32_t*>(buf);
+        column_object->set_num_rows(num_rows);
+        buf += sizeof(uint32_t);
     }
 
     column_object->finalize();
-
+#ifndef NDEBUG
+    // DCHECK size
+    column_object->check_consistency();
+#endif
     return buf;
+}
+
+std::string DataTypeObject::to_string(const IColumn& column, size_t row_num) const {
+    const auto& variant = assert_cast<const ColumnObject&>(column);
+    std::string res;
+    static_cast<void>(variant.serialize_one_row_to_string(row_num, &res));
+    return res;
+}
+
+void DataTypeObject::to_string(const IColumn& column, size_t row_num, BufferWritable& ostr) const {
+    const auto& variant = assert_cast<const ColumnObject&>(column);
+    static_cast<void>(variant.serialize_one_row_to_string(row_num, ostr));
 }
 
 } // namespace doris::vectorized

@@ -20,33 +20,51 @@
 
 #pragma once
 
-#include <sys/resource.h>
-#include <sys/time.h>
+#include <gen_cpp/Metrics_types.h>
+#include <glog/logging.h>
+#include <stdint.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <iostream>
+#include <map>
+#include <memory>
 #include <mutex>
-#include <thread>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "gen_cpp/RuntimeProfile_types.h"
-#include "rapidjson/stringbuffer.h"
-#include "rapidjson/writer.h"
+#include "common/compiler_util.h" // IWYU pragma: keep
 #include "util/binary_cast.hpp"
 #include "util/pretty_printer.h"
 #include "util/stopwatch.hpp"
-#include "util/telemetry/telemetry.h"
 
 namespace doris {
+class TRuntimeProfileNode;
+class TRuntimeProfileTree;
 
 // Some macro magic to generate unique ids using __COUNTER__
 #define CONCAT_IMPL(x, y) x##y
 #define MACRO_CONCAT(x, y) CONCAT_IMPL(x, y)
 
+#define ADD_LABEL_COUNTER(profile, name) (profile)->add_counter(name, TUnit::NONE)
+#define ADD_LABEL_COUNTER_WITH_LEVEL(profile, name, type) \
+    (profile)->add_counter_with_level(name, TUnit::NONE, type)
 #define ADD_COUNTER(profile, name, type) (profile)->add_counter(name, type)
+#define ADD_COUNTER_WITH_LEVEL(profile, name, type, level) \
+    (profile)->add_counter_with_level(name, type, level)
 #define ADD_TIMER(profile, name) (profile)->add_counter(name, TUnit::TIME_NS)
+#define ADD_TIMER_WITH_LEVEL(profile, name, level) \
+    (profile)->add_counter_with_level(name, TUnit::TIME_NS, level)
 #define ADD_CHILD_COUNTER(profile, name, type, parent) (profile)->add_counter(name, type, parent)
+#define ADD_CHILD_COUNTER_WITH_LEVEL(profile, name, type, parent, level) \
+    (profile)->add_counter(name, type, parent, level)
 #define ADD_CHILD_TIMER(profile, name, parent) (profile)->add_counter(name, TUnit::TIME_NS, parent)
+#define ADD_CHILD_TIMER_WITH_LEVEL(profile, name, parent, level) \
+    (profile)->add_counter(name, TUnit::TIME_NS, parent, level)
 #define SCOPED_TIMER(c) ScopedTimer<MonotonicStopWatch> MACRO_CONCAT(SCOPED_TIMER, __COUNTER__)(c)
 #define SCOPED_TIMER_ATOMIC(c) \
     ScopedTimer<MonotonicStopWatch, std::atomic_bool> MACRO_CONCAT(SCOPED_TIMER, __COUNTER__)(c)
@@ -54,9 +72,6 @@ namespace doris {
     ScopedTimer<ThreadCpuStopWatch> MACRO_CONCAT(SCOPED_TIMER, __COUNTER__)(c)
 #define CANCEL_SAFE_SCOPED_TIMER(c, is_cancelled) \
     ScopedTimer<MonotonicStopWatch> MACRO_CONCAT(SCOPED_TIMER, __COUNTER__)(c, is_cancelled)
-#define CANCEL_SAFE_SCOPED_TIMER_ATOMIC(c, is_cancelled)                                       \
-    ScopedTimer<MonotonicStopWatch, std::atomic_bool> MACRO_CONCAT(SCOPED_TIMER, __COUNTER__)( \
-            c, is_cancelled)
 #define SCOPED_RAW_TIMER(c)                                                                  \
     doris::ScopedRawTimer<doris::MonotonicStopWatch, int64_t> MACRO_CONCAT(SCOPED_RAW_TIMER, \
                                                                            __COUNTER__)(c)
@@ -80,7 +95,8 @@ class RuntimeProfile {
 public:
     class Counter {
     public:
-        Counter(TUnit::type type, int64_t value = 0) : _value(value), _type(type) {}
+        Counter(TUnit::type type, int64_t value = 0, int64_t level = 3)
+                : _value(value), _type(type), _level(level) {}
         virtual ~Counter() = default;
 
         virtual void update(int64_t delta) { _value.fetch_add(delta, std::memory_order_relaxed); }
@@ -100,24 +116,34 @@ public:
             return binary_cast<int64_t, double>(_value.load(std::memory_order_relaxed));
         }
 
+        virtual void to_thrift(const std::string& name, std::vector<TCounter>& tcounters,
+                               std::map<std::string, std::set<std::string>>& child_counters_map) {
+            TCounter counter;
+            counter.name = name;
+            counter.value = this->value();
+            counter.type = this->type();
+            counter.__set_level(this->level());
+            tcounters.push_back(std::move(counter));
+        }
+
         TUnit::type type() const { return _type; }
+
+        virtual int64_t level() { return _level; }
 
     private:
         friend class RuntimeProfile;
 
         std::atomic<int64_t> _value;
         TUnit::type _type;
+        int64_t _level;
     };
-
-    class DerivedCounter;
-    class EventSequence;
-    class HighWaterMarkCounter;
 
     /// A counter that keeps track of the highest value seen (reporting that
     /// as value()) and the current value.
     class HighWaterMarkCounter : public Counter {
     public:
-        HighWaterMarkCounter(TUnit::type unit) : Counter(unit), current_value_(0) {}
+        HighWaterMarkCounter(TUnit::type unit, int64_t level = 2)
+                : Counter(unit, 0, level), current_value_(0) {}
 
         virtual void add(int64_t delta) {
             current_value_.fetch_add(delta, std::memory_order_relaxed);
@@ -185,6 +211,26 @@ public:
         DerivedCounterFunction _counter_fn;
     };
 
+    // NonZeroCounter will not be converted to Thrift if the value is 0.
+    class NonZeroCounter : public Counter {
+    public:
+        NonZeroCounter(TUnit::type type, int64_t level, const std::string& parent_name)
+                : Counter(type, 0, level), _parent_name(parent_name) {}
+
+        void to_thrift(const std::string& name, std::vector<TCounter>& tcounters,
+                       std::map<std::string, std::set<std::string>>& child_counters_map) override {
+            if (this->_value > 0) {
+                Counter::to_thrift(name, tcounters, child_counters_map);
+            } else {
+                // remove it
+                child_counters_map[_parent_name].erase(name);
+            }
+        }
+
+    private:
+        const std::string _parent_name;
+    };
+
     // An EventSequence captures a sequence of events (each added by
     // calling MarkEvent). Each event has a text label, and a time
     // (measured relative to the moment start() was called as t=0). It is
@@ -247,14 +293,6 @@ public:
     /// otherwise appended after other child profiles.
     RuntimeProfile* create_child(const std::string& name, bool indent = true, bool prepend = false);
 
-    // Sorts all children according to a custom comparator. Does not
-    // invalidate pointers to profiles.
-    template <class Compare>
-    void sort_childer(const Compare& cmp) {
-        std::lock_guard<std::mutex> l(_children_lock);
-        std::sort(_children.begin(), _children.end(), cmp);
-    }
-
     // Merges the src profile into this one, combining counters that have an identical
     // path. Info strings from profiles are not merged. 'src' would be a const if it
     // weren't for locking.
@@ -274,10 +312,18 @@ public:
     // parent_counter_name.
     // If the counter already exists, the existing counter object is returned.
     Counter* add_counter(const std::string& name, TUnit::type type,
-                         const std::string& parent_counter_name);
+                         const std::string& parent_counter_name, int64_t level = 2);
     Counter* add_counter(const std::string& name, TUnit::type type) {
         return add_counter(name, type, "");
     }
+
+    Counter* add_counter_with_level(const std::string& name, TUnit::type type, int64_t level) {
+        return add_counter(name, type, "", level);
+    }
+
+    NonZeroCounter* add_nonzero_counter(const std::string& name, TUnit::type type,
+                                        const std::string& parent_counter_name = "",
+                                        int64_t level = 2);
 
     // Add a derived counter with 'name'/'type'. The counter is owned by the
     // RuntimeProfile object.
@@ -320,8 +366,6 @@ public:
     // Does not hold locks when it makes any function calls.
     void pretty_print(std::ostream* s, const std::string& prefix = "") const;
 
-    void add_to_span();
-
     // Serializes profile to thrift.
     // Does not hold locks when it makes any function calls.
     void to_thrift(TRuntimeProfileTree* tree);
@@ -346,7 +390,24 @@ public:
     void set_name(const std::string& name) { _name = name; }
 
     int64_t metadata() const { return _metadata; }
-    void set_metadata(int64_t md) { _metadata = md; }
+    void set_metadata(int64_t md) {
+        _is_set_metadata = true;
+        _metadata = md;
+    }
+
+    bool is_set_metadata() const { return _is_set_metadata; }
+
+    void set_is_sink(bool is_sink) {
+        _is_set_sink = true;
+        _is_sink = is_sink;
+    }
+
+    bool is_sink() const { return _is_sink; }
+
+    bool is_set_sink() const { return _is_set_sink; }
+
+    time_t timestamp() const { return _timestamp; }
+    void set_timestamp(time_t ss) { _timestamp = ss; }
 
     // Derived counter function: return measured throughput as input_value/second.
     static int64_t units_per_second(const Counter* total_counter, const Counter* timer);
@@ -379,7 +440,8 @@ public:
     /// Adds a high water mark counter to the runtime profile. Otherwise, same behavior
     /// as AddCounter().
     HighWaterMarkCounter* AddHighWaterMarkCounter(const std::string& name, TUnit::type unit,
-                                                  const std::string& parent_counter_name = "");
+                                                  const std::string& parent_counter_name = "",
+                                                  int64_t level = 2);
 
     // Only for create MemTracker(using profile's counter to calc consumption)
     std::shared_ptr<HighWaterMarkCounter> AddSharedHighWaterMarkCounter(
@@ -405,6 +467,13 @@ private:
 
     // user-supplied, uninterpreted metadata.
     int64_t _metadata;
+    bool _is_set_metadata = false;
+
+    bool _is_sink = false;
+    bool _is_set_sink = false;
+
+    // The timestamp when the profile was modified, make sure the update is up to date.
+    time_t _timestamp;
 
     /// True if this profile is an average derived from other profiles.
     /// All counters in this profile must be of unit AveragedCounter.
@@ -455,29 +524,27 @@ private:
     // of the total time in the entire profile tree.
     double _local_time_percent;
 
-    bool _added_to_span {false};
-
     enum PeriodicCounterType {
         RATE_COUNTER = 0,
         SAMPLING_COUNTER,
     };
 
     struct RateCounterInfo {
-        Counter* src_counter;
+        Counter* src_counter = nullptr;
         SampleFn sample_fn;
         int64_t elapsed_ms;
     };
 
     struct SamplingCounterInfo {
-        Counter* src_counter; // the counter to be sampled
+        Counter* src_counter = nullptr; // the counter to be sampled
         SampleFn sample_fn;
         int64_t total_sampled_value; // sum of all sampled values;
         int64_t num_sampled;         // number of samples taken
     };
 
     struct BucketCountersInfo {
-        Counter* src_counter; // the counter to be sampled
-        int64_t num_sampled;  // number of samples taken
+        Counter* src_counter = nullptr; // the counter to be sampled
+        int64_t num_sampled;            // number of samples taken
         // TODO: customize bucketing
     };
 
@@ -495,17 +562,9 @@ private:
                                      const CounterMap& counter_map,
                                      const ChildCounterMap& child_counter_map, std::ostream* s);
 
-    static void add_child_counters_to_span(OpentelemetrySpan span, const std::string& profile_name,
-                                           const std::string& counter_name,
-                                           const CounterMap& counter_map,
-                                           const ChildCounterMap& child_counter_map);
-
-    static std::string print_json_counter(const std::string& profile_name, Counter* counter) {
-        return print_json_info(profile_name,
-                               PrettyPrinter::print(counter->value(), counter->type()));
+    static std::string print_counter(Counter* counter) {
+        return PrettyPrinter::print(counter->value(), counter->type());
     }
-
-    static std::string print_json_info(const std::string& profile_name, std::string value);
 };
 
 // Utility class to update the counter at object construction and destruction.
@@ -534,7 +593,7 @@ public:
 
 private:
     int64_t _val;
-    RuntimeProfile::Counter* _counter;
+    RuntimeProfile::Counter* _counter = nullptr;
 };
 
 // Utility class to update time elapsed when the object goes out of scope.
@@ -579,8 +638,8 @@ public:
 
 private:
     T _sw;
-    RuntimeProfile::Counter* _counter;
-    const Bool* _is_cancelled;
+    RuntimeProfile::Counter* _counter = nullptr;
+    const Bool* _is_cancelled = nullptr;
 };
 
 // Utility class to update time elapsed when the object goes out of scope.
@@ -599,7 +658,7 @@ public:
 
 private:
     T _sw;
-    C* _counter;
+    C* _counter = nullptr;
 };
 
 } // namespace doris

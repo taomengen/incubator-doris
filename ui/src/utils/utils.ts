@@ -84,4 +84,20 @@ function getBasePath() {
     return res;
 }
 
-export {isSuccess, getDbName, getTimeNow, getBasePath};
+function replaceToTxt(str: string) {
+  var regexpNbsp = /&nbsp;/g;
+  var reBr = /<\/br>/g;
+  const strNoNbsp = str.replace(regexpNbsp, " ");
+  const strNoBr = strNoNbsp.replace(reBr, "\r\n");
+  return strNoBr;
+}
+
+function checkLogin() {
+    const username = localStorage.getItem('username');
+    if (username) {
+        return true;
+    }
+    return false;
+}
+
+export {isSuccess, getDbName, getTimeNow, getBasePath, replaceToTxt, checkLogin};

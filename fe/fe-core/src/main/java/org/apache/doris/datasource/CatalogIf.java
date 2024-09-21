@@ -17,16 +17,27 @@
 
 package org.apache.doris.datasource;
 
+import org.apache.doris.analysis.CreateDbStmt;
+import org.apache.doris.analysis.CreateTableStmt;
+import org.apache.doris.analysis.DropDbStmt;
+import org.apache.doris.analysis.DropTableStmt;
+import org.apache.doris.analysis.TableName;
+import org.apache.doris.analysis.TruncateTableStmt;
 import org.apache.doris.catalog.DatabaseIf;
+import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.TableIf;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.MetaNotFoundException;
+import org.apache.doris.common.UserException;
 
+import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -48,6 +59,10 @@ public interface CatalogIf<T extends DatabaseIf> {
     String getName();
 
     List<String> getDbNames();
+
+    default boolean isInternalCatalog() {
+        return this instanceof InternalCatalog;
+    }
 
     // Will be used when querying the information_schema table
     // Unable to get db for uninitialized catalog to avoid query timeout
@@ -74,9 +89,9 @@ public interface CatalogIf<T extends DatabaseIf> {
         return null;
     }
 
-    default void notifyPropertiesUpdated() {
+    default void notifyPropertiesUpdated(Map<String, String> updatedProps) {
         if (this instanceof ExternalCatalog) {
-            ((ExternalCatalog) this).setUninitialized(false);
+            ((ExternalCatalog) this).onRefresh(false);
         }
     }
 
@@ -140,5 +155,46 @@ public interface CatalogIf<T extends DatabaseIf> {
 
     // Called when catalog is dropped
     default void onClose() {
+        Env.getCurrentEnv().getRefreshManager().removeFromRefreshMap(getId());
     }
+
+    String getComment();
+
+    default void setComment(String comment) {
+    }
+
+    default long getLastUpdateTime() {
+        return -1L;
+    }
+
+    default CatalogLog constructEditLog() {
+        CatalogLog log = new CatalogLog();
+        log.setCatalogId(getId());
+        log.setCatalogName(getName());
+        log.setResource(Strings.nullToEmpty(getResource()));
+        log.setComment(getComment());
+        log.setProps(getProperties());
+        return log;
+    }
+
+    TableName getTableNameByTableId(Long tableId);
+
+    // Return a copy of all db collection.
+    Collection<DatabaseIf<? extends TableIf>> getAllDbs();
+
+    boolean enableAutoAnalyze();
+
+    void createDb(CreateDbStmt stmt) throws DdlException;
+
+    void dropDb(DropDbStmt stmt) throws DdlException;
+
+    /**
+     * @return if org.apache.doris.analysis.CreateTableStmt.ifNotExists is true, return true if table exists,
+     * return false otherwise
+     */
+    boolean createTable(CreateTableStmt stmt) throws UserException;
+
+    void dropTable(DropTableStmt stmt) throws DdlException;
+
+    void truncateTable(TruncateTableStmt truncateTableStmt) throws DdlException;
 }

@@ -19,9 +19,11 @@ package org.apache.doris.analysis;
 
 import org.apache.doris.catalog.AggregateType;
 import org.apache.doris.catalog.Column;
+import org.apache.doris.catalog.InlineView;
 import org.apache.doris.catalog.MaterializedIndexMeta;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.ScalarType;
+import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
@@ -49,25 +51,32 @@ public class MVColumnItem {
 
     public MVColumnItem(String name, Type type, AggregateType aggregateType, boolean isAggregationTypeImplicit,
             Expr defineExpr, String baseColumnName) {
-        this(name, type, aggregateType, isAggregationTypeImplicit, defineExpr, baseColumnName, null);
+        this(name, type, aggregateType, isAggregationTypeImplicit, defineExpr);
     }
 
-    public MVColumnItem(Type type, AggregateType aggregateType,
-            Expr defineExpr, String baseColumnName) {
+    public MVColumnItem(Type type, AggregateType aggregateType, Expr defineExpr, String baseColumnName) {
         this(CreateMaterializedViewStmt.mvColumnBuilder(aggregateType, baseColumnName), type, aggregateType, false,
-                defineExpr, baseColumnName, null);
+                defineExpr);
     }
 
     public MVColumnItem(String name, Type type, AggregateType aggregateType, boolean isAggregationTypeImplicit,
-            Expr defineExpr, String baseColumnName, String baseTableName) {
+            Expr defineExpr) {
         this.name = name;
         this.type = type;
         this.aggregationType = aggregateType;
         this.isAggregationTypeImplicit = isAggregationTypeImplicit;
         this.defineExpr = defineExpr;
         baseColumnNames = new HashSet<>();
-        baseColumnNames.add(baseColumnName);
-        this.baseTableName = baseTableName;
+
+        Map<Long, Set<String>> tableIdToColumnNames = defineExpr.getTableIdToColumnNames();
+        if (defineExpr instanceof SlotRef) {
+            baseColumnNames = new HashSet<>();
+            baseColumnNames.add(this.name);
+        } else if (tableIdToColumnNames.size() == 1) {
+            for (Map.Entry<Long, Set<String>> entry : tableIdToColumnNames.entrySet()) {
+                baseColumnNames = entry.getValue();
+            }
+        }
     }
 
     public MVColumnItem(String name, Type type) {
@@ -90,11 +99,11 @@ public class MVColumnItem {
 
         this.type = defineExpr.getType();
         if (this.type instanceof ScalarType && this.type.isStringType()) {
+            this.type = new ScalarType(type.getPrimitiveType());
             ((ScalarType) this.type).setMaxLength();
         }
 
         Map<Long, Set<String>> tableIdToColumnNames = defineExpr.getTableIdToColumnNames();
-
         if (defineExpr instanceof SlotRef) {
             baseColumnNames = new HashSet<>();
             baseColumnNames.add(this.name);
@@ -154,6 +163,16 @@ public class MVColumnItem {
         return baseTableName;
     }
 
+    public Column toMVColumn(Table table) throws DdlException {
+        if (table instanceof OlapTable) {
+            return toMVColumn((OlapTable) table);
+        } else if (table instanceof InlineView) {
+            return toMVColumn((InlineView) table);
+        } else {
+            throw new DdlException("Failed to convert to a materialized view column, column=" + getName() + ".");
+        }
+    }
+
     public Column toMVColumn(OlapTable olapTable) throws DdlException {
         Column baseColumn = olapTable.getBaseColumn(name);
         Column result;
@@ -167,10 +186,6 @@ public class MVColumnItem {
                 throw new DdlException("base column's type is null, column=" + result.getName());
             }
             result.setIsKey(isKey);
-            // If the mv column type is inconsistent with the base column type, the daily
-            // test will core.
-            // So, I comment this line firstly.
-            // result.setType(type);
         } else {
             if (type == null) {
                 throw new DdlException("MVColumnItem type is null");
@@ -186,7 +201,11 @@ public class MVColumnItem {
         return result;
     }
 
-    public void setBaseTableName(String baseTableName) {
-        this.baseTableName = baseTableName;
+    public Column toMVColumn(InlineView view) throws DdlException {
+        Column baseColumn = view.getColumn(name);
+        if (baseColumn == null) {
+            throw new DdlException("Failed to get the column (" + name + ") in a view (" + view + ").");
+        }
+        return new Column(baseColumn);
     }
 }

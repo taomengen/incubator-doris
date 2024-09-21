@@ -20,10 +20,10 @@
 
 #pragma once
 
-#include <vec/aggregate_functions/aggregate_function.h>
-#include <vec/data_types/data_type.h>
-
 #include <memory>
+
+#include "vec/aggregate_functions/aggregate_function.h"
+#include "vec/data_types/data_type.h"
 
 namespace doris::vectorized {
 
@@ -49,8 +49,6 @@ namespace doris::vectorized {
 class IAggregateFunctionCombinator {
 public:
     virtual String get_name() const = 0;
-
-    virtual bool is_for_internal_usage_only() const { return false; }
 
     /** From the arguments for combined function (ex: UInt64, UInt8 for sumIf),
       *  get the arguments for nested function (ex: UInt64 for sum).

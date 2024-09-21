@@ -21,8 +21,11 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.common.CheckpointException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
+import org.apache.doris.common.util.HttpURLUtil;
 import org.apache.doris.common.util.MasterDaemon;
 import org.apache.doris.common.util.NetUtils;
+import org.apache.doris.httpv2.entity.ResponseBody;
+import org.apache.doris.httpv2.rest.RestApiStatusCode;
 import org.apache.doris.metric.MetricRepo;
 import org.apache.doris.monitor.jvm.JvmService;
 import org.apache.doris.monitor.jvm.JvmStats;
@@ -40,7 +43,6 @@ import org.apache.logging.log4j.Logger;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
-import java.net.URL;
 import java.util.Iterator;
 import java.util.List;
 
@@ -56,6 +58,7 @@ public class Checkpoint extends MasterDaemon {
     private Env env;
     private String imageDir;
     private EditLog editLog;
+    private int memoryNotEnoughCount = 0;
 
     public Checkpoint(EditLog editLog) {
         super("leaderCheckpointer", FeConstants.checkpoint_interval_second * 1000L);
@@ -83,6 +86,10 @@ public class Checkpoint extends MasterDaemon {
     // public for unit test, so that we can trigger checkpoint manually.
     // DO NOT call it manually outside the unit test.
     public synchronized void doCheckpoint() throws CheckpointException {
+        if (!Env.getServingEnv().isHttpReady()) {
+            LOG.info("Http server is not ready.");
+            return;
+        }
         long imageVersion = 0;
         long checkPointVersion = 0;
         Storage storage = null;
@@ -128,7 +135,7 @@ public class Checkpoint extends MasterDaemon {
                         String.format("checkpoint version should be %d," + " actual replayed journal id is %d",
                                 checkPointVersion, env.getReplayedJournalId()));
             }
-            env.fixBugAfterMetadataReplayed(false);
+            env.postProcessAfterMetadataReplayed(false);
             latestImageFilePath = env.saveImage();
             replayedJournalId = env.getReplayedJournalId();
 
@@ -185,8 +192,8 @@ public class Checkpoint extends MasterDaemon {
         if (!allFrontends.isEmpty()) {
             otherNodesCount = allFrontends.size() - 1; // skip master itself
             for (Frontend fe : allFrontends) {
-                String host = fe.getIp();
-                if (host.equals(Env.getServingEnv().getMasterIp())) {
+                String host = fe.getHost();
+                if (host.equals(Env.getServingEnv().getMasterHost())) {
                     // skip master itself
                     continue;
                 }
@@ -197,14 +204,18 @@ public class Checkpoint extends MasterDaemon {
                 LOG.info("Put image:{}", url);
 
                 try {
-                    MetaHelper.getRemoteFile(url, PUT_TIMEOUT_SECOND * 1000, new NullOutputStream());
-                    successPushed++;
+                    ResponseBody responseBody = MetaHelper.doGet(url, PUT_TIMEOUT_SECOND * 1000, Object.class);
+                    if (responseBody.getCode() == RestApiStatusCode.OK.code) {
+                        successPushed++;
+                    } else {
+                        LOG.warn("Failed when pushing image file. url = {},responseBody = {}", url, responseBody);
+                    }
                 } catch (IOException e) {
                     LOG.error("Exception when pushing image file. url = {}", url, e);
                 }
             }
 
-            LOG.info("push image.{} to other nodes. totally {} nodes, push succeed {} nodes",
+            LOG.info("push image.{} to other nodes. totally {} nodes, push succeeded {} nodes",
                     replayedJournalId, otherNodesCount, successPushed);
         }
         if (successPushed == otherNodesCount) {
@@ -227,13 +238,13 @@ public class Checkpoint extends MasterDaemon {
                 long deleteVersion = storage.getLatestValidatedImageSeq();
                 if (successPushed > 0) {
                     for (Frontend fe : allFrontends) {
-                        String host = fe.getIp();
-                        if (host.equals(Env.getServingEnv().getMasterIp())) {
+                        String host = fe.getHost();
+                        if (host.equals(Env.getServingEnv().getMasterHost())) {
                             // skip master itself
                             continue;
                         }
                         int port = Config.http_port;
-                        URL idURL;
+                        String idURL;
                         HttpURLConnection conn = null;
                         try {
                             /*
@@ -242,8 +253,8 @@ public class Checkpoint extends MasterDaemon {
                              * any non-master node's current replayed journal id. otherwise,
                              * this lagging node can never get the deleted journal.
                              */
-                            idURL = new URL("http://" + NetUtils.getHostPortInAccessibleFormat(host, port) + "/journal_id");
-                            conn = (HttpURLConnection) idURL.openConnection();
+                            idURL = "http://" + NetUtils.getHostPortInAccessibleFormat(host, port) + "/journal_id";
+                            conn = HttpURLUtil.getConnectionWithNodeIdent(idURL);
                             conn.setConnectTimeout(CONNECT_TIMEOUT_SECOND * 1000);
                             conn.setReadTimeout(READ_TIMEOUT_SECOND * 1000);
                             String idString = conn.getHeaderField("id");
@@ -313,13 +324,23 @@ public class Checkpoint extends MasterDaemon {
         long memUsedPercent = getMemoryUsedPercent();
         LOG.info("get jvm memory used percent: {} %", memUsedPercent);
 
-        if (memUsedPercent > Config.metadata_checkpoint_memory_threshold && !Config.force_do_metadata_checkpoint) {
-            LOG.warn("the memory used percent {} exceed the checkpoint memory threshold: {}",
-                    memUsedPercent, Config.metadata_checkpoint_memory_threshold);
+        if (memUsedPercent <= Config.metadata_checkpoint_memory_threshold || Config.force_do_metadata_checkpoint) {
+            memoryNotEnoughCount = 0;
+            return true;
+        }
+
+        LOG.warn("the memory used percent {} exceed the checkpoint memory threshold: {}, exceeded count: {}",
+                memUsedPercent, Config.metadata_checkpoint_memory_threshold, memoryNotEnoughCount);
+
+        memoryNotEnoughCount += 1;
+        if (memoryNotEnoughCount != Config.checkpoint_manual_gc_threshold) {
             return false;
         }
 
-        return true;
+        LOG.warn("the not enough memory count has reached the manual gc threshold {}",
+                Config.checkpoint_manual_gc_threshold);
+        System.gc();
+        return checkMemoryEnoughToDoCheckpoint();
     }
 
     /*

@@ -20,20 +20,26 @@
 
 #pragma once
 
+#include <limits.h>
+#include <stddef.h>
+
+#include <boost/intrusive/detail/algo_type.hpp>
 #include <boost/intrusive/list.hpp>
 #include <boost/intrusive/list_hook.hpp>
+// IWYU pragma: no_include <bits/chrono.h>
+#include <chrono> // IWYU pragma: keep
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <iosfwd>
 #include <memory>
+#include <mutex>
 #include <string>
-#include <type_traits>
 #include <unordered_set>
-#include <utility>
 
+#include "agent/cgroup_cpu_ctl.h"
 #include "common/status.h"
-#include "gutil/ref_counted.h"
-#include "util/priority_thread_pool.hpp"
+#include "util/work_thread_pool.hpp"
 
 namespace doris {
 
@@ -101,6 +107,7 @@ public:
     ThreadPoolBuilder& set_min_threads(int min_threads);
     ThreadPoolBuilder& set_max_threads(int max_threads);
     ThreadPoolBuilder& set_max_queue_size(int max_queue_size);
+    ThreadPoolBuilder& set_cgroup_cpu_ctl(CgroupCpuCtl* cgroup_cpu_ctl);
     template <class Rep, class Period>
     ThreadPoolBuilder& set_idle_timeout(const std::chrono::duration<Rep, Period>& idle_timeout) {
         _idle_timeout = std::chrono::duration_cast<std::chrono::milliseconds>(idle_timeout);
@@ -126,6 +133,7 @@ private:
     int _min_threads;
     int _max_threads;
     int _max_queue_size;
+    CgroupCpuCtl* _cgroup_cpu_ctl = nullptr;
     std::chrono::milliseconds _idle_timeout;
 
     ThreadPoolBuilder(const ThreadPoolBuilder&) = delete;
@@ -248,6 +256,13 @@ public:
         return _total_queued_tasks;
     }
 
+    std::vector<int> debug_info() {
+        std::lock_guard<std::mutex> l(_lock);
+        std::vector<int> arr = {_num_threads, static_cast<int>(_threads.size()), _min_threads,
+                                _max_threads};
+        return arr;
+    }
+
 private:
     friend class ThreadPoolBuilder;
     friend class ThreadPoolToken;
@@ -329,6 +344,8 @@ private:
     //
     // Protected by _lock.
     int _total_queued_tasks;
+
+    CgroupCpuCtl* _cgroup_cpu_ctl = nullptr;
 
     // All allocated tokens.
     //
@@ -477,7 +494,7 @@ private:
     ThreadPool::ExecutionMode _mode;
 
     // Pointer to the token's thread pool.
-    ThreadPool* _pool;
+    ThreadPool* _pool = nullptr;
 
     // Token state machine.
     State _state;

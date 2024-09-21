@@ -18,18 +18,53 @@
 #pragma once
 
 #include "common/status.h"
+#include "exprs/hybrid_set.h"
 #include "vec/exprs/vexpr.h"
 
 namespace doris::vectorized {
 class VDirectInPredicate final : public VExpr {
+    ENABLE_FACTORY_CREATOR(VDirectInPredicate);
+
 public:
-    VDirectInPredicate(const TExprNode& node)
-            : VExpr(node), _filter(nullptr), _expr_name("direct_in_predicate") {}
+    VDirectInPredicate(const TExprNode& node, const std::shared_ptr<HybridSetBase>& filter)
+            : VExpr(node), _filter(filter), _expr_name("direct_in_predicate") {}
     ~VDirectInPredicate() override = default;
 
-    Status execute(VExprContext* context, doris::vectorized::Block* block,
-                   int* result_column_id) override {
-        doris::vectorized::ColumnNumbers arguments(_children.size());
+    Status prepare(RuntimeState* state, const RowDescriptor& row_desc,
+                   VExprContext* context) override {
+        RETURN_IF_ERROR_OR_PREPARED(VExpr::prepare(state, row_desc, context));
+        _prepare_finished = true;
+        return Status::OK();
+    }
+
+    Status open(RuntimeState* state, VExprContext* context,
+                FunctionContext::FunctionStateScope scope) override {
+        DCHECK(_prepare_finished);
+        RETURN_IF_ERROR(VExpr::open(state, context, scope));
+        _open_finished = true;
+        return Status::OK();
+    }
+
+    Status execute(VExprContext* context, Block* block, int* result_column_id) override {
+        ColumnNumbers arguments;
+        return _do_execute(context, block, result_column_id, arguments);
+    }
+
+    Status execute_runtime_fitler(doris::vectorized::VExprContext* context,
+                                  doris::vectorized::Block* block, int* result_column_id,
+                                  std::vector<size_t>& args) override {
+        return _do_execute(context, block, result_column_id, args);
+    }
+
+    const std::string& expr_name() const override { return _expr_name; }
+
+    std::shared_ptr<HybridSetBase> get_set_func() const override { return _filter; }
+
+private:
+    Status _do_execute(VExprContext* context, Block* block, int* result_column_id,
+                       std::vector<size_t>& arguments) {
+        DCHECK(_open_finished || _getting_const_col);
+        arguments.resize(_children.size());
         for (int i = 0; i < _children.size(); ++i) {
             int column_id = -1;
             RETURN_IF_ERROR(_children[i]->execute(context, block, &column_id));
@@ -43,30 +78,14 @@ public:
         size_t sz = argument_column->size();
         res_data_column->resize(sz);
 
-        auto ptr = ((ColumnVector<UInt8>*)res_data_column.get())->get_data().data();
-        auto type = WhichDataType(remove_nullable(block->get_by_position(arguments[0]).type));
-        if (type.is_string_or_fixed_string()) {
-            for (size_t i = 0; i < sz; i++) {
-                auto ele = argument_column->get_data_at(i);
-                StringRef v(ele.data, ele.size);
-                ptr[i] = _filter->find(reinterpret_cast<const void*>(&v));
-            }
-        } else if (type.is_int_or_uint() || type.is_float()) {
-            if (argument_column->is_nullable()) {
-                auto column_nested = reinterpret_cast<const ColumnNullable*>(argument_column.get())
-                                             ->get_nested_column_ptr();
-                auto column_nullmap = reinterpret_cast<const ColumnNullable*>(argument_column.get())
-                                              ->get_null_map_column_ptr();
-                _filter->find_fixed_len(column_nested->get_raw_data().data,
-                                        (uint8*)column_nullmap->get_raw_data().data, sz, ptr);
-            } else {
-                _filter->find_fixed_len(argument_column->get_raw_data().data, nullptr, sz, ptr);
-            }
+        if (argument_column->is_nullable()) {
+            auto column_nested = static_cast<const ColumnNullable*>(argument_column.get())
+                                         ->get_nested_column_ptr();
+            const auto& null_map =
+                    static_cast<const ColumnNullable*>(argument_column.get())->get_null_map_data();
+            _filter->find_batch_nullable(*column_nested, sz, null_map, res_data_column->get_data());
         } else {
-            for (size_t i = 0; i < sz; i++) {
-                ptr[i] = _filter->find(
-                        reinterpret_cast<const void*>(argument_column->get_data_at(i).data));
-            }
+            _filter->find_batch(*argument_column, sz, res_data_column->get_data());
         }
 
         DCHECK(!_data_type->is_nullable());
@@ -77,17 +96,6 @@ public:
         return Status::OK();
     }
 
-    VExpr* clone(doris::ObjectPool* pool) const override {
-        return pool->add(new VDirectInPredicate(*this));
-    }
-
-    const std::string& expr_name() const override { return _expr_name; }
-
-    void set_filter(std::shared_ptr<HybridSetBase>& filter) { _filter = filter; }
-
-    std::shared_ptr<HybridSetBase> get_set_func() const override { return _filter; }
-
-private:
     std::shared_ptr<HybridSetBase> _filter;
     std::string _expr_name;
 };

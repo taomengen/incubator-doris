@@ -18,6 +18,7 @@
 #ifndef DORIS_BE_SRC_OLAP_ROWSET_ROWSET_READER_CONTEXT_H
 #define DORIS_BE_SRC_OLAP_ROWSET_ROWSET_READER_CONTEXT_H
 
+#include "io/io_common.h"
 #include "olap/column_predicate.h"
 #include "olap/olap_common.h"
 #include "runtime/runtime_state.h"
@@ -32,11 +33,11 @@ class DeleteHandler;
 class TabletSchema;
 
 struct RowsetReaderContext {
-    ReaderType reader_type = READER_QUERY;
+    ReaderType reader_type = ReaderType::READER_QUERY;
     Version version {-1, -1};
     TabletSchemaSPtr tablet_schema = nullptr;
-    // flag for enable topn opt
-    bool use_topn_opt = false;
+    std::vector<int> topn_filter_source_node_ids;
+    int topn_filter_target_node_id = -1;
     // whether rowset should return ordered rows.
     bool need_ordered_result = true;
     // used for special optimization for query : ORDER BY key DESC LIMIT n
@@ -46,14 +47,13 @@ struct RowsetReaderContext {
     // limit of rows for read_orderby_key
     size_t read_orderby_key_limit = 0;
     // filter_block arguments
-    vectorized::VExprContext** filter_block_vconjunct_ctx_ptr = nullptr;
+    vectorized::VExprContextSPtrs filter_block_conjuncts;
     // projection columns: the set of columns rowset reader should return
     const std::vector<uint32_t>* return_columns = nullptr;
     TPushAggOp::type push_down_agg_type_opt = TPushAggOp::NONE;
     // column name -> column predicate
     // adding column_name for predicate to make use of column selectivity
     const std::vector<ColumnPredicate*>* predicates = nullptr;
-    const std::vector<ColumnPredicate*>* predicates_except_leafnode_of_andnode = nullptr;
     // value column predicate in UNIQUE table
     const std::vector<ColumnPredicate*>* value_predicates = nullptr;
     const std::vector<RowCursor>* lower_bound_keys = nullptr;
@@ -63,8 +63,8 @@ struct RowsetReaderContext {
     const DeleteHandler* delete_handler = nullptr;
     OlapReaderStatistics* stats = nullptr;
     RuntimeState* runtime_state = nullptr;
-    vectorized::VExpr* remaining_vconjunct_root = nullptr;
-    vectorized::VExprContext* common_vexpr_ctxs_pushdown = nullptr;
+    std::vector<vectorized::VExprSPtr> remaining_conjunct_roots;
+    vectorized::VExprContextSPtrs common_expr_ctxs_push_down;
     bool use_page_cache = false;
     int sequence_id_idx = -1;
     int batch_size = 1024;
@@ -78,6 +78,11 @@ struct RowsetReaderContext {
     bool is_vertical_compaction = false;
     bool is_key_column_group = false;
     const std::set<int32_t>* output_columns = nullptr;
+    RowsetId rowset_id;
+    // slots that cast may be eliminated in storage layer
+    std::map<std::string, TypeDescriptor> target_cast_type_for_variants;
+    int64_t ttl_seconds = 0;
+    size_t topn_limit = 0;
 };
 
 } // namespace doris

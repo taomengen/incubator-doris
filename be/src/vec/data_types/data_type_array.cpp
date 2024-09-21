@@ -20,14 +20,26 @@
 
 #include "vec/data_types/data_type_array.h"
 
-#include "gen_cpp/data.pb.h"
-#include "util/stack_util.h"
+#include <ctype.h>
+#include <gen_cpp/data.pb.h>
+#include <glog/logging.h>
+#include <string.h>
+
+#include <typeinfo>
+#include <utility>
+
+#include "runtime/decimalv2_value.h"
+#include "util/types.h"
 #include "vec/columns/column.h"
 #include "vec/columns/column_array.h"
 #include "vec/columns/column_const.h"
 #include "vec/columns/column_nullable.h"
 #include "vec/common/assert_cast.h"
+#include "vec/common/string_buffer.hpp"
+#include "vec/common/string_ref.h"
+#include "vec/common/typeid_cast.h"
 #include "vec/data_types/data_type_nullable.h"
+#include "vec/io/reader_buffer.h"
 
 namespace doris::vectorized {
 
@@ -42,7 +54,9 @@ MutableColumnPtr DataTypeArray::create_column() const {
 }
 
 Field DataTypeArray::get_default() const {
-    return Array();
+    Array a;
+    a.push_back(nested->get_default());
+    return a;
 }
 
 bool DataTypeArray::equals(const IDataType& rhs) const {
@@ -104,17 +118,6 @@ void DataTypeArray::to_pb_column_meta(PColumnMeta* col_meta) const {
     get_nested_type()->to_pb_column_meta(children);
 }
 
-void get_decimal_value(const IColumn& nested_column, DecimalV2Value& decimal_value, size_t pos) {
-    const IColumn* nested_col = &nested_column;
-    if (nested_column.is_nullable()) {
-        nested_col =
-                reinterpret_cast<const ColumnNullable*>(&nested_column)->get_nested_column_ptr();
-    }
-    decimal_value = (DecimalV2Value)(reinterpret_cast<const PackedInt128*>(
-                                             nested_col->get_data_at(pos).data)
-                                             ->value);
-}
-
 void DataTypeArray::to_string(const IColumn& column, size_t row_num, BufferWritable& ostr) const {
     auto result = check_column_const_set_readability(column, row_num);
     ColumnPtr ptr = result.first;
@@ -137,11 +140,6 @@ void DataTypeArray::to_string(const IColumn& column, size_t row_num, BufferWrita
             ostr.write("'", 1);
             nested->to_string(nested_column, i, ostr);
             ostr.write("'", 1);
-        } else if (which.is_decimal()) {
-            DecimalV2Value decimal_value;
-            get_decimal_value(nested_column, decimal_value, i);
-            std::string decimal_str = decimal_value.to_string();
-            ostr.write(decimal_str.c_str(), decimal_str.size());
         } else {
             nested->to_string(nested_column, i, ostr);
         }
@@ -171,10 +169,6 @@ std::string DataTypeArray::to_string(const IColumn& column, size_t row_num) cons
             str += "'";
             str += nested->to_string(nested_column, i);
             str += "'";
-        } else if (which.is_decimal()) {
-            DecimalV2Value decimal_value;
-            get_decimal_value(nested_column, decimal_value, i);
-            str += decimal_value.to_string();
         } else {
             str += nested->to_string(nested_column, i);
         }

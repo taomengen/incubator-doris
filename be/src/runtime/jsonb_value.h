@@ -18,16 +18,18 @@
 #ifndef DORIS_BE_RUNTIME_JSON_VALUE_H
 #define DORIS_BE_RUNTIME_JSON_VALUE_H
 
-#include "udf/udf.h"
-#include "util/cpu_info.h"
-#include "util/hash_util.hpp"
-#include "util/jsonb_error.h"
-#include "util/jsonb_parser_simd.h"
-#include "util/jsonb_utils.h"
-#include "vec/common/string_ref.h"
+#include <glog/logging.h>
 
-#ifdef __SSE4_2__
-#include "util/sse_util.hpp"
+#include <cstddef>
+#include <ostream>
+#include <string>
+
+#include "common/status.h"
+#include "util/hash_util.hpp"
+#ifdef __AVX2__
+#include "util/jsonb_parser_simd.h"
+#else
+#include "util/jsonb_parser.h"
 #endif
 
 namespace doris {
@@ -38,12 +40,16 @@ struct JsonBinaryValue {
     // default nullprt and size 0 for invalid or NULL value
     const char* ptr = nullptr;
     size_t len = 0;
-    JsonbParserSIMD parser;
+    JsonbParser parser;
 
     JsonBinaryValue() : ptr(nullptr), len(0) {}
-    JsonBinaryValue(char* ptr, int len) { from_json_string(const_cast<const char*>(ptr), len); }
-    JsonBinaryValue(const std::string& s) { from_json_string(s.c_str(), s.length()); }
-    JsonBinaryValue(const char* ptr, int len) { from_json_string(ptr, len); }
+    JsonBinaryValue(char* ptr, int len) {
+        static_cast<void>(from_json_string(const_cast<const char*>(ptr), len));
+    }
+    JsonBinaryValue(const std::string& s) {
+        static_cast<void>(from_json_string(s.c_str(), s.length()));
+    }
+    JsonBinaryValue(const char* ptr, int len) { static_cast<void>(from_json_string(ptr, len)); }
 
     const char* value() { return ptr; }
 
@@ -56,46 +62,57 @@ struct JsonBinaryValue {
 
     bool operator==(const JsonBinaryValue& other) const {
         LOG(FATAL) << "comparing between JsonBinaryValue is not supported";
+        __builtin_unreachable();
     }
     // !=
     bool ne(const JsonBinaryValue& other) const {
         LOG(FATAL) << "comparing between JsonBinaryValue is not supported";
+        __builtin_unreachable();
     }
     // <=
     bool le(const JsonBinaryValue& other) const {
         LOG(FATAL) << "comparing between JsonBinaryValue is not supported";
+        __builtin_unreachable();
     }
     // >=
     bool ge(const JsonBinaryValue& other) const {
         LOG(FATAL) << "comparing between JsonBinaryValue is not supported";
+        __builtin_unreachable();
     }
     // <
     bool lt(const JsonBinaryValue& other) const {
         LOG(FATAL) << "comparing between JsonBinaryValue is not supported";
+        __builtin_unreachable();
     }
     // >
     bool gt(const JsonBinaryValue& other) const {
         LOG(FATAL) << "comparing between JsonBinaryValue is not supported";
+        __builtin_unreachable();
     }
 
     bool operator!=(const JsonBinaryValue& other) const {
         LOG(FATAL) << "comparing between JsonBinaryValue is not supported";
+        __builtin_unreachable();
     }
 
     bool operator<=(const JsonBinaryValue& other) const {
         LOG(FATAL) << "comparing between JsonBinaryValue is not supported";
+        __builtin_unreachable();
     }
 
     bool operator>=(const JsonBinaryValue& other) const {
         LOG(FATAL) << "comparing between JsonBinaryValue is not supported";
+        __builtin_unreachable();
     }
 
     bool operator<(const JsonBinaryValue& other) const {
         LOG(FATAL) << "comparing between JsonBinaryValue is not supported";
+        __builtin_unreachable();
     }
 
     bool operator>(const JsonBinaryValue& other) const {
         LOG(FATAL) << "comparing between JsonBinaryValue is not supported";
+        __builtin_unreachable();
     }
 
     Status from_json_string(const char* s, int len);

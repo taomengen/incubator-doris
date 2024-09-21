@@ -18,6 +18,7 @@
 package org.apache.doris.nereids.trees.plans.logical;
 
 import org.apache.doris.nereids.memo.GroupExpression;
+import org.apache.doris.nereids.properties.DataTrait;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
@@ -41,7 +42,7 @@ import java.util.Optional;
  * LogicalRepeat.
  */
 public class LogicalRepeat<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_TYPE>
-        implements Repeat<CHILD_TYPE>, OutputSavePoint {
+        implements Repeat<CHILD_TYPE> {
 
     // max num of distinct sets in grouping sets clause
     public static final int MAX_GROUPING_SETS_NUM = 64;
@@ -85,6 +86,11 @@ public class LogicalRepeat<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
     }
 
     @Override
+    public List<NamedExpression> getOutputs() {
+        return outputExpressions;
+    }
+
+    @Override
     public String toString() {
         return Utils.toSqlString("LogicalRepeat",
                 "groupingSets", groupingSets,
@@ -112,9 +118,7 @@ public class LogicalRepeat<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
                 .build();
     }
 
-    /**
-     * Determine the equality with another plan
-     */
+    @Override
     public boolean equals(Object o) {
         if (this == o) {
             return true;
@@ -122,9 +126,8 @@ public class LogicalRepeat<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
         if (o == null || getClass() != o.getClass()) {
             return false;
         }
-        LogicalRepeat that = (LogicalRepeat) o;
-        return Objects.equals(groupingSets, that.groupingSets)
-                && Objects.equals(outputExpressions, that.outputExpressions);
+        LogicalRepeat<?> that = (LogicalRepeat<?>) o;
+        return groupingSets.equals(that.groupingSets) && outputExpressions.equals(that.outputExpressions);
     }
 
     @Override
@@ -145,9 +148,15 @@ public class LogicalRepeat<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
     }
 
     @Override
-    public LogicalRepeat<CHILD_TYPE> withLogicalProperties(Optional<LogicalProperties> logicalProperties) {
-        return new LogicalRepeat<>(groupingSets, outputExpressions, Optional.empty(),
-                logicalProperties, child());
+    public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
+            Optional<LogicalProperties> logicalProperties, List<Plan> children) {
+        Preconditions.checkArgument(children.size() == 1);
+        return new LogicalRepeat<>(groupingSets, outputExpressions, groupExpression, logicalProperties,
+                children.get(0));
+    }
+
+    public LogicalRepeat<CHILD_TYPE> withGroupSets(List<List<Expression>> groupingSets) {
+        return new LogicalRepeat<>(groupingSets, outputExpressions, child());
     }
 
     public LogicalRepeat<CHILD_TYPE> withGroupSetsAndOutput(List<List<Expression>> groupingSets,
@@ -165,8 +174,32 @@ public class LogicalRepeat<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
         return new LogicalRepeat<>(groupingSets, outputExpressionList, child);
     }
 
+    public LogicalRepeat<Plan> withAggOutputAndChild(List<NamedExpression> newOutput, Plan child) {
+        return new LogicalRepeat<>(groupingSets, newOutput, child);
+    }
+
     public boolean canBindVirtualSlot() {
         return bound() && outputExpressions.stream()
                 .noneMatch(output -> output.containsType(VirtualSlotReference.class));
+    }
+
+    @Override
+    public void computeUnique(DataTrait.Builder builder) {
+        // don't generate unique slot
+    }
+
+    @Override
+    public void computeUniform(DataTrait.Builder builder) {
+        builder.addUniformSlot(child(0).getLogicalProperties().getTrait());
+    }
+
+    @Override
+    public void computeEqualSet(DataTrait.Builder builder) {
+        builder.addEqualSet(child().getLogicalProperties().getTrait());
+    }
+
+    @Override
+    public void computeFd(DataTrait.Builder builder) {
+        builder.addFuncDepsDG(child().getLogicalProperties().getTrait());
     }
 }

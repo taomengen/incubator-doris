@@ -17,10 +17,16 @@
 
 #include "vec/data_types/data_type_hll.h"
 
+#include <string.h>
+
+#include <utility>
+
+#include "util/slice.h"
 #include "vec/columns/column.h"
 #include "vec/columns/column_complex.h"
 #include "vec/columns/column_const.h"
 #include "vec/common/assert_cast.h"
+#include "vec/common/string_buffer.hpp"
 #include "vec/io/io_helper.h"
 
 namespace doris::vectorized {
@@ -33,7 +39,7 @@ char* DataTypeHLL::serialize(const IColumn& column, char* buf, int be_exec_versi
     auto& data_column = assert_cast<const ColumnHLL&>(*ptr);
 
     size_t row_num = column.size();
-    size_t hll_size_array[row_num + 1];
+    std::vector<size_t> hll_size_array(row_num + 1);
     hll_size_array[0] = row_num;
 
     auto allocate_len_size = sizeof(size_t) * (row_num + 1);
@@ -47,7 +53,7 @@ char* DataTypeHLL::serialize(const IColumn& column, char* buf, int be_exec_versi
         buf += actual_size;
     }
 
-    memcpy(buf_start, hll_size_array, allocate_len_size);
+    memcpy(buf_start, hll_size_array.data(), allocate_len_size);
     return buf;
 }
 
@@ -60,8 +66,8 @@ const char* DataTypeHLL::deserialize(const char* buf, IColumn* column, int be_ex
 
     size_t row_num = *reinterpret_cast<const size_t*>(buf);
     buf += sizeof(size_t);
-    size_t hll_size_array[row_num];
-    memcpy(hll_size_array, buf, sizeof(size_t) * row_num);
+    std::vector<size_t> hll_size_array(row_num);
+    memcpy(hll_size_array.data(), buf, sizeof(size_t) * row_num);
     buf += sizeof(size_t) * row_num;
 
     data.resize(row_num);
@@ -79,7 +85,7 @@ int64_t DataTypeHLL::get_uncompressed_serialized_bytes(const IColumn& column,
     auto& data_column = assert_cast<const ColumnHLL&>(*ptr);
 
     auto allocate_len_size = sizeof(size_t) * (column.size() + 1);
-    auto allocate_content_size = 0;
+    size_t allocate_content_size = 0;
     for (size_t i = 0; i < column.size(); ++i) {
         auto& hll = const_cast<HyperLogLog&>(data_column.get_element(i));
         allocate_content_size += hll.max_serialized_size();
@@ -118,6 +124,18 @@ void DataTypeHLL::to_string(const class doris::vectorized::IColumn& column, size
     size_t actual_size = data.serialize((uint8_t*)result.data());
     result.resize(actual_size);
     ostr.write(result.c_str(), result.size());
+}
+
+Status DataTypeHLL::from_string(ReadBuffer& rb, IColumn* column) const {
+    auto& data_column = assert_cast<ColumnHLL&>(*column);
+    auto& data = data_column.get_data();
+
+    HyperLogLog hll;
+    if (!hll.deserialize(Slice(rb.to_string()))) {
+        return Status::InternalError("deserialize hll from string fail!");
+    }
+    data.push_back(std::move(hll));
+    return Status::OK();
 }
 
 } // namespace doris::vectorized

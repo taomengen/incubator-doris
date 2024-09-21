@@ -31,8 +31,6 @@ public class NullLiteral extends Literal {
 
     public static final NullLiteral INSTANCE = new NullLiteral();
 
-    private DataType dataType;
-
     public NullLiteral() {
         super(NullType.INSTANCE);
     }
@@ -58,7 +56,7 @@ public class NullLiteral extends Literal {
 
     @Override
     public LiteralExpr toLegacyLiteral() {
-        return new org.apache.doris.analysis.NullLiteral();
+        return org.apache.doris.analysis.NullLiteral.create(dataType.toCatalogDataType());
     }
 
     @Override

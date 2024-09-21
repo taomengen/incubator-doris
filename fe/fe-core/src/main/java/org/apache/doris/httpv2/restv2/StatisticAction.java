@@ -19,6 +19,7 @@ package org.apache.doris.httpv2.restv2;
 
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.Config;
+import org.apache.doris.common.UserException;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.httpv2.entity.ResponseEntityBuilder;
 import org.apache.doris.httpv2.rest.RestBaseController;
@@ -50,9 +51,14 @@ public class StatisticAction extends RestBaseController {
             executeCheckPassword(request, response);
         }
 
-        if (!Env.getCurrentEnv().isMaster()) {
-            return redirectToMaster(request, response);
+        try {
+            if (!Env.getCurrentEnv().isMaster()) {
+                return redirectToMasterOrException(request, response);
+            }
+        } catch (Exception e) {
+            return ResponseEntityBuilder.okWithCommonError(e.getMessage());
         }
+
         Map<String, Object> resultMap = Maps.newHashMap();
         Env env = Env.getCurrentEnv();
         SystemInfoService infoService = Env.getCurrentSystemInfo();
@@ -60,7 +66,7 @@ public class StatisticAction extends RestBaseController {
         resultMap.put("dbCount", env.getInternalCatalog().getDbIds().size());
         resultMap.put("tblCount", getTblCount(env));
         resultMap.put("diskOccupancy", getDiskOccupancy(infoService));
-        resultMap.put("beCount", infoService.getClusterBackendIds(SystemInfoService.DEFAULT_CLUSTER).size());
+        resultMap.put("beCount", infoService.getAllBackendIds().size());
         resultMap.put("feCount", env.getFrontends(null).size());
         resultMap.put("remainDisk", getRemainDisk(infoService));
 
@@ -75,7 +81,13 @@ public class StatisticAction extends RestBaseController {
 
     private long getDiskOccupancy(SystemInfoService infoService) {
         long diskOccupancy = 0;
-        List<Backend> backends = infoService.getClusterBackends(SystemInfoService.DEFAULT_CLUSTER);
+        List<Backend> backends;
+        try {
+            backends = infoService.getAllBackendsByAllCluster().values().asList();
+        } catch (UserException e) {
+            LOG.warn("failed to get backends by current cluster", e);
+            return 0;
+        }
         for (Backend be : backends) {
             diskOccupancy += be.getDataUsedCapacityB();
         }
@@ -84,7 +96,13 @@ public class StatisticAction extends RestBaseController {
 
     private long getRemainDisk(SystemInfoService infoService) {
         long remainDisk = 0;
-        List<Backend> backends = infoService.getClusterBackends(SystemInfoService.DEFAULT_CLUSTER);
+        List<Backend> backends;
+        try {
+            backends = infoService.getAllBackendsByAllCluster().values().asList();
+        } catch (UserException e) {
+            LOG.warn("failed to get backends by current cluster", e);
+            return 0;
+        }
         for (Backend be : backends) {
             remainDisk += be.getAvailableCapacityB();
         }

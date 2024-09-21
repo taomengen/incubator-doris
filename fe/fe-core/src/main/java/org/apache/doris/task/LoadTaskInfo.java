@@ -27,6 +27,7 @@ import org.apache.doris.thrift.TFileFormatType;
 import org.apache.doris.thrift.TFileType;
 
 import com.google.common.collect.Lists;
+import com.google.gson.annotations.SerializedName;
 
 import java.util.List;
 
@@ -89,6 +90,16 @@ public interface LoadTaskInfo {
 
     Separator getLineDelimiter();
 
+    /**
+     * only for csv
+     */
+    byte getEnclose();
+
+    /**
+     * only for csv
+     */
+    byte getEscape();
+
     int getSendBatchParallelism();
 
     boolean isLoadToSingleTablet();
@@ -96,6 +107,8 @@ public interface LoadTaskInfo {
     String getHeaderType();
 
     List<String> getHiddenColumns();
+
+    boolean isPartialUpdate();
 
     default boolean getTrimDoubleQuotes() {
         return false;
@@ -105,8 +118,22 @@ public interface LoadTaskInfo {
         return 0;
     }
 
+    default boolean getEnableProfile() {
+        return false;
+    }
+
+    default boolean isMemtableOnSinkNode() {
+        return false;
+    }
+
+    default int getStreamPerNode() {
+        return 2;
+    }
+
     class ImportColumnDescs {
+        @SerializedName("des")
         public List<ImportColumnDesc> descs = Lists.newArrayList();
+        @SerializedName("icdr")
         public boolean isColumnDescsRewrited = false;
 
         public List<String> getFileColNames() {
@@ -130,4 +157,3 @@ public interface LoadTaskInfo {
         }
     }
 }
-

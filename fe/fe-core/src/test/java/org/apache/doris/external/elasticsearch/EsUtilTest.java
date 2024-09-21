@@ -21,6 +21,11 @@ import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.EsTable;
 import org.apache.doris.catalog.PrimitiveType;
 import org.apache.doris.common.ExceptionChecker;
+import org.apache.doris.datasource.es.DorisEsException;
+import org.apache.doris.datasource.es.EsRestClient;
+import org.apache.doris.datasource.es.EsUtil;
+import org.apache.doris.datasource.es.MappingPhase;
+import org.apache.doris.datasource.es.SearchContext;
 
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import mockit.Expectations;
@@ -245,9 +250,45 @@ public class EsUtilTest extends EsTestCase {
                 Assertions.assertEquals("datetimev2(0)", type);
             }
             if ("test8".equals(name)) {
-                Assertions.assertEquals("bigint(20)", type);
+                Assertions.assertEquals("bigint", type);
             }
         }
+    }
+
+    @Test
+    public void testFieldAlias() throws IOException, URISyntaxException {
+        ObjectNode testFieldAlias = EsUtil.getRootSchema(
+                EsUtil.getMapping(loadJsonFromFile("data/es/test_field_alias.json")), null, new ArrayList<>());
+        List<Column> parseColumns = EsUtil.genColumnsFromEs("test_field_alias", null, testFieldAlias, true, new ArrayList<>());
+        Assertions.assertEquals("datetimev2(0)", parseColumns.get(2).getType().toSql());
+        Assertions.assertEquals("text", parseColumns.get(4).getType().toSql());
+    }
+
+    @Test
+    public void testComplexType() throws IOException, URISyntaxException {
+        ObjectNode testFieldAlias = EsUtil.getRootSchema(
+                EsUtil.getMapping(loadJsonFromFile("data/es/es6_dynamic_complex_type.json")), null, new ArrayList<>());
+        List<Column> columns = EsUtil.genColumnsFromEs("test_complex_type", "complex_type", testFieldAlias, true,
+                new ArrayList<>());
+        Assertions.assertEquals(3, columns.size());
+    }
+
+    @Test
+    public void testDynamicMapping() throws IOException, URISyntaxException {
+
+        ObjectNode testAliases = EsUtil.getMappingProps("test", loadJsonFromFile("data/es/dynamic_mappings.json"),
+                null);
+        Assertions.assertEquals("{\"time\":{\"type\":\"long\"},\"type\":{\"type\":\"keyword\"},\"userId\":{\"type\":\"text\",\"fields\":{\"keyword\":{\"type\":\"keyword\"}}}}",
+                testAliases.toString());
+
+    }
+
+    @Test
+    public void testDefaultMapping() throws IOException, URISyntaxException {
+        ObjectNode testAliases = EsUtil.getMappingProps("test", loadJsonFromFile("data/es/default_mappings.json"),
+                null);
+        Assertions.assertEquals("{\"@timestamp\":{\"type\":\"date\"},\"@version\":{\"type\":\"keyword\"},\"act\":{\"type\":\"text\",\"norms\":false,\"fields\":{\"keyword\":{\"type\":\"keyword\",\"ignore_above\":256}}},\"app\":{\"type\":\"text\",\"norms\":false,\"fields\":{\"keyword\":{\"type\":\"keyword\",\"ignore_above\":256}}},\"tags\":{\"type\":\"text\",\"norms\":false,\"fields\":{\"keyword\":{\"type\":\"keyword\",\"ignore_above\":256}}},\"type\":{\"type\":\"text\",\"norms\":false,\"fields\":{\"keyword\":{\"type\":\"keyword\",\"ignore_above\":256}}},\"uid\":{\"type\":\"text\",\"norms\":false,\"fields\":{\"keyword\":{\"type\":\"keyword\",\"ignore_above\":256}}}}",
+                testAliases.toString());
     }
 
 }

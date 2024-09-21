@@ -34,6 +34,10 @@ public interface ExpressionTrait extends TreeNode<Expression> {
 
     boolean nullable();
 
+    default boolean notNullable() {
+        return !nullable();
+    }
+
     // check legality before do type coercion.
     // maybe we should merge checkInputDataTypes and checkLegality later.
     @Developing
@@ -41,10 +45,6 @@ public interface ExpressionTrait extends TreeNode<Expression> {
 
     @Developing
     default void checkLegalityAfterRewrite() {}
-
-    default boolean notNullable() {
-        return !nullable();
-    }
 
     default List<Expression> getArguments() {
         return children();
@@ -66,10 +66,28 @@ public interface ExpressionTrait extends TreeNode<Expression> {
     }
 
     default DataType getDataType() throws UnboundException {
-        throw new UnboundException("dataType");
+        throw new UnboundException(toSql() + ".getDataType()");
     }
 
     default String toSql() throws UnboundException {
         throw new UnboundException("sql");
+    }
+
+    default boolean foldable() {
+        return true;
+    }
+
+    /**
+     * Identify the expression itself is deterministic or not, default true
+     */
+    default boolean isDeterministic() {
+        return true;
+    }
+
+    /**
+     * Identify the expression is containing deterministic expr or not
+     */
+    default boolean containsNondeterministic() {
+        return anyMatch(expr -> !((ExpressionTrait) expr).isDeterministic());
     }
 }

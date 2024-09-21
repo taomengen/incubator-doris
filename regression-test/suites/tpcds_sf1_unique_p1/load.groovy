@@ -94,7 +94,7 @@ suite("load") {
         sql new File("""${context.file.parent}/ddl/${table}.sql""").text
     }
 
-    sql "set global exec_mem_limit=8G;"
+    sql "set exec_mem_limit=8G;"
 
     for (String tableName in tables) {
         streamLoad {
@@ -139,6 +139,12 @@ suite("load") {
         }
     }
 
+    Thread.sleep(70000) // wait for row count report of the tables just loaded
+    for (String tableName in tables) {
+        sql """SET query_timeout=1800"""
+        sql """ ANALYZE TABLE $tableName WITH SYNC """
+    }
+
     // CREATE-TABLE-AS-SELECT
     sql "drop table if exists t;"
     sql "create table if not exists t properties('replication_num'='1') as select * from item;"
@@ -150,4 +156,6 @@ suite("load") {
     sql "insert into tt select * from t"
     new_count = sql "select count(*) from tt"
     assertEquals(origin_count, new_count)
+
+    sql """ sync """
 }

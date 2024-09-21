@@ -21,7 +21,7 @@ import org.apache.doris.alter.AlterOpType;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.UserException;
 
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 
 import java.util.Map;
 
@@ -66,6 +66,16 @@ public class DropIndexClause extends AlterTableClause {
         if (StringUtils.isEmpty(indexName)) {
             throw new AnalysisException("index name is excepted");
         }
+    }
+
+    @Override
+    public boolean allowOpMTMV() {
+        return true;
+    }
+
+    @Override
+    public boolean needChangeMTMVState() {
+        return false;
     }
 
     @Override

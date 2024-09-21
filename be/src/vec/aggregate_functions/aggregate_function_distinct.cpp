@@ -20,14 +20,24 @@
 
 #include "vec/aggregate_functions/aggregate_function_distinct.h"
 
+#include <ostream>
+
 #include "vec/aggregate_functions/aggregate_function_combinator.h"
 #include "vec/aggregate_functions/aggregate_function_simple_factory.h"
 #include "vec/aggregate_functions/helpers.h"
-#include "vec/common/typeid_cast.h"
-#include "vec/data_types/data_type.h"
 #include "vec/data_types/data_type_nullable.h"
 
 namespace doris::vectorized {
+
+template <typename T>
+struct Reducer {
+    template <bool stable>
+    using Output = AggregateFunctionDistinctSingleNumericData<T, stable>;
+    using AggregateFunctionDistinctNormal = AggregateFunctionDistinct<Output, false>;
+};
+
+template <typename T>
+using AggregateFunctionDistinctNumeric = Reducer<T>::AggregateFunctionDistinctNormal;
 
 class AggregateFunctionCombinatorDistinct final : public IAggregateFunctionCombinator {
 public:
@@ -35,8 +45,9 @@ public:
 
     DataTypes transform_arguments(const DataTypes& arguments) const override {
         if (arguments.empty()) {
-            LOG(FATAL)
-                    << "Incorrect number of arguments for aggregate function with Distinct suffix";
+            throw doris::Exception(
+                    ErrorCode::INTERNAL_ERROR,
+                    "Incorrect number of arguments for aggregate function with Distinct suffix");
         }
         return arguments;
     }
@@ -51,28 +62,20 @@ public:
 
         if (arguments.size() == 1) {
             AggregateFunctionPtr res(
-                    creator_with_numeric_type::create<AggregateFunctionDistinct,
-                                                      AggregateFunctionDistinctSingleNumericData>(
-                            result_is_nullable, arguments, nested_function));
+                    creator_with_numeric_type::create<AggregateFunctionDistinctNumeric>(
+                            arguments, result_is_nullable, nested_function));
             if (res) {
                 return res;
             }
 
-            if (arguments[0]->is_value_unambiguously_represented_in_contiguous_memory_region()) {
-                res.reset(creator_without_type::create<AggregateFunctionDistinct<
-                                  AggregateFunctionDistinctSingleGenericData<true>>>(
-                        result_is_nullable, arguments, nested_function));
-            } else {
-                res.reset(creator_without_type::create<AggregateFunctionDistinct<
-                                  AggregateFunctionDistinctSingleGenericData<false>>>(
-                        result_is_nullable, arguments, nested_function));
-            }
+            res = creator_without_type::create<
+                    AggregateFunctionDistinct<AggregateFunctionDistinctSingleGenericData>>(
+                    arguments, result_is_nullable, nested_function);
             return res;
         }
-        return AggregateFunctionPtr(
-                creator_without_type::create<
-                        AggregateFunctionDistinct<AggregateFunctionDistinctMultipleGenericData>>(
-                        result_is_nullable, arguments, nested_function));
+        return creator_without_type::create<
+                AggregateFunctionDistinct<AggregateFunctionDistinctMultipleGenericData>>(
+                arguments, result_is_nullable, nested_function);
     }
 };
 
@@ -88,7 +91,8 @@ void register_aggregate_function_combinator_distinct(AggregateFunctionSimpleFact
         auto function_combinator = std::make_shared<AggregateFunctionCombinatorDistinct>();
         auto transform_arguments = function_combinator->transform_arguments(nested_types);
         auto nested_function_name = name.substr(DISTINCT_FUNCTION_PREFIX.size());
-        auto nested_function = factory.get(nested_function_name, transform_arguments);
+        auto nested_function = factory.get(nested_function_name, transform_arguments, false,
+                                           BeExecVersionManager::get_newest_version());
         return function_combinator->transform_aggregate_function(nested_function, types,
                                                                  result_is_nullable);
     };

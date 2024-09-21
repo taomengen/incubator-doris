@@ -7,14 +7,15 @@
     "doc": {
       "properties": {
         "test1": {
-          "type": "keyword"
+          "type": "keyword",
+          "ignore_above": 10
         },
         "test2": {
           "type": "text",
           "fields": {
             "keyword": {
               "type": "keyword",
-              "ignore_above": 256
+              "ignore_above": 10
             }
           }
         },
@@ -22,6 +23,12 @@
           "type": "double"
         },
         "test4": {
+          "type": "date"
+        },
+        "test5": {
+          "type": "long"
+        },
+        "test6": {
           "type": "date"
         },
         "c_bool": {
@@ -40,7 +47,7 @@
           "type": "long"
         },
         "c_unsigned_long": {
-          "type": "unsigned_long"
+          "type": "long"
         },
         "c_float": {
           "type": "float"
@@ -81,6 +88,18 @@
               "type": "integer"
             }
           }
+        },
+        "message": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "c_user": {
+          "type": "nested"
         }
       }
     }

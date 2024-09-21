@@ -18,7 +18,6 @@
 package org.apache.doris.nereids.trees.expressions.functions.scalar;
 
 import org.apache.doris.catalog.FunctionSignature;
-import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.literal.StringLiteral;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
@@ -51,21 +50,23 @@ public class AesDecrypt extends AesCryptoFunction {
                             VarcharType.SYSTEM_DEFAULT,
                             VarcharType.SYSTEM_DEFAULT),
             FunctionSignature.ret(StringType.INSTANCE)
-                    .args(StringType.INSTANCE, StringType.INSTANCE, StringType.INSTANCE, StringType.INSTANCE)
+                    .args(StringType.INSTANCE, StringType.INSTANCE, StringType.INSTANCE, StringType.INSTANCE),
+            FunctionSignature.ret(VarcharType.SYSTEM_DEFAULT)
+                    .args(VarcharType.SYSTEM_DEFAULT,
+                            VarcharType.SYSTEM_DEFAULT,
+                            VarcharType.SYSTEM_DEFAULT,
+                            VarcharType.SYSTEM_DEFAULT,
+                            VarcharType.SYSTEM_DEFAULT),
+            FunctionSignature.ret(StringType.INSTANCE)
+                    .args(StringType.INSTANCE, StringType.INSTANCE, StringType.INSTANCE, StringType.INSTANCE,
+                            StringType.INSTANCE)
     );
 
     /**
-     * Some javadoc for checkstyle...
+     * AesDecrypt
      */
     public AesDecrypt(Expression arg0, Expression arg1) {
-        super("aes_decrypt", arg0, arg1, getDefaultBlockEncryptionMode());
-        String blockEncryptionMode = String.valueOf(getDefaultBlockEncryptionMode());
-        if (!blockEncryptionMode.toUpperCase().equals("'AES_128_ECB'")
-                && !blockEncryptionMode.toUpperCase().equals("'AES_192_ECB'")
-                && !blockEncryptionMode.toUpperCase().equals("'AES_256_ECB'")) {
-            throw new AnalysisException("Incorrect parameter count in the call to native function "
-                    + "'aes_encrypt' or 'aes_decrypt'");
-        }
+        super("aes_decrypt", arg0, arg1, new StringLiteral(""), getDefaultBlockEncryptionMode());
     }
 
     public AesDecrypt(Expression arg0, Expression arg1, Expression arg2) {
@@ -76,21 +77,25 @@ public class AesDecrypt extends AesCryptoFunction {
         super("aes_decrypt", arg0, arg1, arg2, arg3);
     }
 
+    public AesDecrypt(Expression arg0, Expression arg1, Expression arg2, Expression arg3, Expression arg4) {
+        super("aes_decrypt", arg0, arg1, arg2, arg3, arg4);
+    }
+
     /**
      * withChildren.
      */
     @Override
     public AesDecrypt withChildren(List<Expression> children) {
-        Preconditions.checkArgument(children.size() >= 2 && children.size() <= 4);
+        Preconditions.checkArgument(children.size() >= 2 && children.size() <= 5);
         if (children.size() == 2) {
             return new AesDecrypt(children.get(0), children.get(1));
         } else if (children().size() == 3) {
             return new AesDecrypt(children.get(0), children.get(1), children.get(2));
+        } else if (children().size() == 4) {
+            return new AesDecrypt(children.get(0), children.get(1), children.get(2), children.get(3));
         } else {
-            if (!(children.get(3) instanceof StringLiteral)) {
-                throw new AnalysisException("the 4th parameter should be string literal: " + this.toSql());
-            }
-            return new AesDecrypt(children.get(0), children.get(1), children.get(2), (StringLiteral) children.get(3));
+            return new AesDecrypt(children.get(0), children.get(1), children.get(2), children.get(3),
+                    children.get(4));
         }
     }
 

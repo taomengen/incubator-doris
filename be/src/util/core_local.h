@@ -17,15 +17,19 @@
 
 #pragma once
 
+#include <butil/macros.h>
+#include <sched.h>
+#include <stddef.h>
+
 #include <deque>
 #include <map>
-#include <memory>
 #include <mutex>
+#include <new>
 #include <thread>
+#include <utility>
 #include <vector>
 
-#include "common/compiler_util.h"
-#include "gutil/macros.h"
+#include "common/compiler_util.h" // IWYU pragma: keep
 
 namespace doris {
 

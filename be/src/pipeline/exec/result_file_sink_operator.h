@@ -18,28 +18,100 @@
 #pragma once
 
 #include "operator.h"
+#include "vec/sink/writer/vfile_result_writer.h"
 
-namespace doris {
-namespace vectorized {
-class VResultFileSink;
-}
+namespace doris::vectorized {
+template <typename Parent>
+class BlockSerializer;
+template <typename Parent>
+class Channel;
+class BroadcastPBlockHolder;
+} // namespace doris::vectorized
 
-namespace pipeline {
+namespace doris::pipeline {
 
-class ResultFileSinkOperatorBuilder final
-        : public DataSinkOperatorBuilder<vectorized::VResultFileSink> {
+class ResultFileSinkOperatorX;
+class ResultFileSinkLocalState final
+        : public AsyncWriterSink<vectorized::VFileResultWriter, ResultFileSinkOperatorX> {
 public:
-    ResultFileSinkOperatorBuilder(int32_t id, DataSink* sink);
+    using Base = AsyncWriterSink<vectorized::VFileResultWriter, ResultFileSinkOperatorX>;
+    ENABLE_FACTORY_CREATOR(ResultFileSinkLocalState);
+    ResultFileSinkLocalState(DataSinkOperatorXBase* parent, RuntimeState* state);
+    ~ResultFileSinkLocalState() override;
 
-    OperatorPtr build_operator() override;
+    Status init(RuntimeState* state, LocalSinkStateInfo& info) override;
+    Status open(RuntimeState* state) override;
+    Status close(RuntimeState* state, Status exec_status) override;
+
+    [[nodiscard]] int sender_id() const { return _sender_id; }
+
+    RuntimeProfile::Counter* brpc_wait_timer() { return _brpc_wait_timer; }
+    RuntimeProfile::Counter* local_send_timer() { return _local_send_timer; }
+    RuntimeProfile::Counter* brpc_send_timer() { return _brpc_send_timer; }
+    RuntimeProfile::Counter* merge_block_timer() { return _merge_block_timer; }
+    RuntimeProfile::Counter* split_block_distribute_by_channel_timer() {
+        return _split_block_distribute_by_channel_timer;
+    }
+
+private:
+    friend class ResultFileSinkOperatorX;
+
+    template <typename ChannelPtrType>
+    void _handle_eof_channel(RuntimeState* state, ChannelPtrType channel, Status st);
+
+    std::unique_ptr<vectorized::Block> _output_block;
+    std::shared_ptr<BufferControlBlock> _sender;
+
+    std::vector<vectorized::Channel<ResultFileSinkLocalState>*> _channels;
+    bool _only_local_exchange = false;
+    std::unique_ptr<vectorized::BlockSerializer<ResultFileSinkLocalState>> _serializer;
+    std::shared_ptr<vectorized::BroadcastPBlockHolder> _block_holder;
+    RuntimeProfile::Counter* _brpc_wait_timer = nullptr;
+    RuntimeProfile::Counter* _local_send_timer = nullptr;
+    RuntimeProfile::Counter* _brpc_send_timer = nullptr;
+    RuntimeProfile::Counter* _merge_block_timer = nullptr;
+    RuntimeProfile::Counter* _split_block_distribute_by_channel_timer = nullptr;
+
+    int _sender_id;
 };
 
-class ResultFileSinkOperator final : public DataSinkOperator<ResultFileSinkOperatorBuilder> {
+class ResultFileSinkOperatorX final : public DataSinkOperatorX<ResultFileSinkLocalState> {
 public:
-    ResultFileSinkOperator(OperatorBuilderBase* operator_builder, DataSink* sink);
+    ResultFileSinkOperatorX(int operator_id, const RowDescriptor& row_desc,
+                            const std::vector<TExpr>& t_output_expr);
+    ResultFileSinkOperatorX(int operator_id, const RowDescriptor& row_desc,
+                            const TResultFileSink& sink,
+                            const std::vector<TPlanFragmentDestination>& destinations,
+                            const std::vector<TExpr>& t_output_expr, DescriptorTbl& descs);
+    Status init(const TDataSink& thrift_sink) override;
 
-    bool can_write() override { return true; }
+    Status open(RuntimeState* state) override;
+
+    Status sink(RuntimeState* state, vectorized::Block* in_block, bool eos) override;
+
+private:
+    friend class ResultFileSinkLocalState;
+    template <typename Writer, typename Parent>
+        requires(std::is_base_of_v<vectorized::AsyncResultWriter, Writer>)
+    friend class AsyncWriterSink;
+
+    const RowDescriptor& _row_desc;
+    const std::vector<TExpr>& _t_output_expr;
+
+    const std::vector<TPlanFragmentDestination> _dests;
+
+    // set file options when sink type is FILE
+    std::unique_ptr<ResultFileOptions> _file_opts;
+    TStorageBackendType::type _storage_type;
+
+    // Owned by the RuntimeState.
+    RowDescriptor _output_row_descriptor;
+    int _buf_size = 4096; // Allocated from _pool
+    bool _is_top_sink = true;
+    std::string _header;
+    std::string _header_type;
+
+    vectorized::VExprContextSPtrs _output_vexpr_ctxs;
 };
 
-} // namespace pipeline
-} // namespace doris
+} // namespace doris::pipeline

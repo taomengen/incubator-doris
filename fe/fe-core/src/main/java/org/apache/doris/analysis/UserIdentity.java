@@ -41,7 +41,6 @@ import org.apache.logging.log4j.Logger;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
-import java.util.Set;
 
 // https://dev.mysql.com/doc/refman/8.0/en/account-names.html
 // user name must be literally matched.
@@ -58,10 +57,6 @@ public class UserIdentity implements Writable, GsonPostProcessable {
     private String host;
     @SerializedName(value = "isDomain")
     private boolean isDomain;
-    // The roles which this user belongs to.
-    // Used for authorization in Access Controller
-    // This field is only set when getting current user from auth and not need to persist
-    private Set<String> roles;
 
     private boolean isAnalyzed = false;
 
@@ -117,6 +112,10 @@ public class UserIdentity implements Writable, GsonPostProcessable {
         return user;
     }
 
+    public String getUser() {
+        return user;
+    }
+
     public String getHost() {
         return host;
     }
@@ -129,15 +128,7 @@ public class UserIdentity implements Writable, GsonPostProcessable {
         this.isAnalyzed = true;
     }
 
-    public void setRoles(Set<String> roles) {
-        this.roles = roles;
-    }
-
-    public Set<String> getRoles() {
-        return roles;
-    }
-
-    public void analyze(String clusterName) throws AnalysisException {
+    public void analyze() throws AnalysisException {
         if (isAnalyzed) {
             return;
         }
@@ -146,10 +137,6 @@ public class UserIdentity implements Writable, GsonPostProcessable {
         }
 
         FeNameFormat.checkUserName(user);
-        if (!user.equals(Auth.ROOT_USER) && !user.equals(Auth.ADMIN_USER)) {
-            user = ClusterNamespace.getFullName(clusterName, user);
-        }
-
         if (Strings.isNullOrEmpty(host)) {
             if (!isDomain) {
                 host = "%";
@@ -225,6 +212,11 @@ public class UserIdentity implements Writable, GsonPostProcessable {
         return sb.toString();
     }
 
+    // should be remove after version 3.0
+    public void removeClusterPrefix() {
+        user = ClusterNamespace.getNameFromFullName(user);
+    }
+
     public static UserIdentity read(DataInput in) throws IOException {
         // Use Gson in the VERSION_109
         if (Env.getCurrentEnvJournalVersion() < FeMetaVersion.VERSION_109) {
@@ -294,5 +286,6 @@ public class UserIdentity implements Writable, GsonPostProcessable {
     @Override
     public void gsonPostProcess() throws IOException {
         isAnalyzed = true;
+        removeClusterPrefix();
     }
 }

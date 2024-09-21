@@ -21,7 +21,7 @@ import org.apache.doris.alter.AlterOpType;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.util.PropertyAnalyzer;
 
-import org.apache.parquet.Strings;
+import com.google.common.base.Strings;
 
 import java.util.Map;
 
@@ -68,6 +68,16 @@ public class ReplaceTableClause extends AlterTableClause {
     @Override
     public Map<String, String> getProperties() {
         return this.properties;
+    }
+
+    @Override
+    public boolean allowOpMTMV() {
+        return false;
+    }
+
+    @Override
+    public boolean needChangeMTMVState() {
+        return true;
     }
 
     @Override

@@ -19,7 +19,6 @@ package org.apache.doris.load;
 
 import org.apache.doris.analysis.CancelExportStmt;
 import org.apache.doris.analysis.CompoundPredicate;
-import org.apache.doris.analysis.ExportStmt;
 import org.apache.doris.analysis.TableName;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
@@ -27,22 +26,27 @@ import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.CaseSensibility;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
+import org.apache.doris.common.ErrorCode;
+import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.LabelAlreadyUsedException;
 import org.apache.doris.common.PatternMatcher;
 import org.apache.doris.common.PatternMatcherWrapper;
+import org.apache.doris.common.util.BrokerUtil;
 import org.apache.doris.common.util.ListComparator;
 import org.apache.doris.common.util.OrderByPair;
 import org.apache.doris.common.util.TimeUtils;
+import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.scheduler.exception.JobException;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.gson.Gson;
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -59,22 +63,26 @@ import java.util.stream.Collectors;
 
 public class ExportMgr {
     private static final Logger LOG = LogManager.getLogger(ExportJob.class);
+    private Map<Long, ExportJob> exportIdToJob = Maps.newHashMap(); // exportJobId to exportJob
+    // dbid -> <label -> job>
+    private Map<Long, Map<String, Long>> dbTolabelToExportJobId = Maps.newHashMap();
 
     // lock for export job
     // lock is private and must use after db lock
-    private ReentrantReadWriteLock lock = new ReentrantReadWriteLock(true);
-
-    private Map<Long, ExportJob> idToJob = Maps.newHashMap(); // exportJobId to exportJob
-    private Map<String, Long> labelToJobId = Maps.newHashMap();
+    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock(true);
 
     public ExportMgr() {
     }
 
-    public void readLock() {
+    public List<ExportJob> getJobs() {
+        return Lists.newArrayList(exportIdToJob.values());
+    }
+
+    private void readLock() {
         lock.readLock().lock();
     }
 
-    public void readUnlock() {
+    private void readUnlock() {
         lock.readLock().unlock();
     }
 
@@ -86,19 +94,33 @@ public class ExportMgr {
         lock.writeLock().unlock();
     }
 
-    public List<ExportJob> getJobs() {
-        return Lists.newArrayList(idToJob.values());
-    }
-
-    public void addExportJob(ExportStmt stmt) throws Exception {
+    public void addExportJobAndRegisterTask(ExportJob job) throws Exception {
         long jobId = Env.getCurrentEnv().getNextId();
-        ExportJob job = createJob(jobId, stmt);
+        job.setId(jobId);
         writeLock();
         try {
-            if (labelToJobId.containsKey(job.getLabel())) {
-                throw new LabelAlreadyUsedException(job.getLabel());
+            if (dbTolabelToExportJobId.containsKey(job.getDbId())
+                    && dbTolabelToExportJobId.get(job.getDbId()).containsKey(job.getLabel())) {
+                Long oldJobId = dbTolabelToExportJobId.get(job.getDbId()).get(job.getLabel());
+                ExportJob oldJob = exportIdToJob.get(oldJobId);
+                if (oldJob != null && oldJob.getState() != ExportJobState.CANCELLED) {
+                    throw new LabelAlreadyUsedException(job.getLabel());
+                }
             }
             unprotectAddJob(job);
+            // delete existing files
+            if (Config.enable_delete_existing_files && Boolean.parseBoolean(job.getDeleteExistingFiles())) {
+                if (job.getBrokerDesc() == null) {
+                    throw new AnalysisException("Local file system does not support delete existing files");
+                }
+                String fullPath = job.getExportPath();
+                BrokerUtil.deleteDirectoryWithFileSystem(fullPath.substring(0, fullPath.lastIndexOf('/') + 1),
+                        job.getBrokerDesc());
+            }
+            job.getTaskExecutors().forEach(executor -> {
+                Long taskId = Env.getCurrentEnv().getTransientTaskManager().addMemoryTask(executor);
+                job.getTaskIdToExecutor().put(taskId, executor);
+            });
             Env.getCurrentEnv().getEditLog().logExportCreate(job);
         } finally {
             writeUnlock();
@@ -117,14 +139,47 @@ public class ExportMgr {
         if (matchExportJobs.isEmpty()) {
             throw new DdlException("All export job(s) are at final state (CANCELLED/FINISHED)");
         }
-        for (ExportJob exportJob : matchExportJobs) {
-            exportJob.cancel(ExportFailMsg.CancelType.USER_CANCEL, "user cancel");
+
+        // check auth
+        checkCancelExportJobAuth(InternalCatalog.INTERNAL_CATALOG_NAME, stmt.getDbName(), matchExportJobs);
+        try {
+            for (ExportJob exportJob : matchExportJobs) {
+                // exportJob.cancel(ExportFailMsg.CancelType.USER_CANCEL, "user cancel");
+                exportJob.updateExportJobState(ExportJobState.CANCELLED, 0L, null,
+                        ExportFailMsg.CancelType.USER_CANCEL, "user cancel");
+            }
+        } catch (JobException e) {
+            throw new AnalysisException(e.getMessage());
+        }
+    }
+
+    public void checkCancelExportJobAuth(String ctlName, String dbName, List<ExportJob> jobs) throws AnalysisException {
+        if (jobs.size() > 1) {
+            if (!Env.getCurrentEnv().getAccessManager()
+                    .checkDbPriv(ConnectContext.get(), ctlName, dbName,
+                            PrivPredicate.SELECT)) {
+                ErrorReport.reportAnalysisException(ErrorCode.ERR_DB_ACCESS_DENIED_ERROR,
+                        PrivPredicate.SELECT.getPrivs().toString(), dbName);
+            }
+        } else {
+            TableName tableName = jobs.get(0).getTableName();
+            if (tableName == null) {
+                return;
+            }
+            if (!Env.getCurrentEnv().getAccessManager()
+                    .checkTblPriv(ConnectContext.get(), ctlName, dbName,
+                            tableName.getTbl(),
+                            PrivPredicate.SELECT)) {
+                ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLE_ACCESS_DENIED_ERROR,
+                        PrivPredicate.SELECT.getPrivs().toString(), tableName.getTbl());
+            }
         }
     }
 
     public void unprotectAddJob(ExportJob job) {
-        idToJob.put(job.getId(), job);
-        labelToJobId.putIfAbsent(job.getLabel(), job.getId());
+        exportIdToJob.put(job.getId(), job);
+        dbTolabelToExportJobId.computeIfAbsent(job.getDbId(),
+                k -> Maps.newHashMap()).put(job.getLabel(), job.getId());
     }
 
     private List<ExportJob> getWaitingCancelJobs(CancelExportStmt stmt) throws AnalysisException {
@@ -163,31 +218,21 @@ public class ExportMgr {
         };
     }
 
-    private ExportJob createJob(long jobId, ExportStmt stmt) throws Exception {
-        ExportJob job = new ExportJob(jobId);
-        job.setJob(stmt);
-        return job;
-    }
-
-    public List<ExportJob> getExportJobs(ExportJob.JobState state) {
-        List<ExportJob> result = Lists.newArrayList();
+    public ExportJob getJob(long jobId) {
+        ExportJob job;
         readLock();
         try {
-            for (ExportJob job : idToJob.values()) {
-                if (job.getState() == state) {
-                    result.add(job);
-                }
-            }
+            job = exportIdToJob.get(jobId);
         } finally {
             readUnlock();
         }
-
-        return result;
+        return job;
     }
 
+    // used for `show export` statement
     // NOTE: jobid and states may both specified, or only one of them, or neither
     public List<List<String>> getExportJobInfosByIdOrState(
-            long dbId, long jobId, String label, boolean isLabelUseLike, Set<ExportJob.JobState> states,
+            long dbId, long jobId, String label, boolean isLabelUseLike, Set<ExportJobState> states,
             ArrayList<OrderByPair> orderByPairs, long limit) throws AnalysisException {
 
         long resultNum = limit == -1L ? Integer.MAX_VALUE : limit;
@@ -200,9 +245,9 @@ public class ExportMgr {
         readLock();
         try {
             int counter = 0;
-            for (ExportJob job : idToJob.values()) {
+            for (ExportJob job : exportIdToJob.values()) {
                 long id = job.getId();
-                ExportJob.JobState state = job.getState();
+                ExportJobState state = job.getState();
                 String jobLabel = job.getLabel();
 
                 if (job.getDbId() != dbId) {
@@ -234,7 +279,7 @@ public class ExportMgr {
                     exportJobInfos.add(composeExportJobInfo(job));
                 }
 
-                if (++counter >= resultNum) {
+                if (++counter >= resultNum && orderByPairs == null) {
                     break;
                 }
             }
@@ -254,8 +299,12 @@ public class ExportMgr {
         Collections.sort(exportJobInfos, comparator);
 
         List<List<String>> results = Lists.newArrayList();
+        int counter = 0;
         for (List<Comparable> list : exportJobInfos) {
             results.add(list.stream().map(e -> e.toString()).collect(Collectors.toList()));
+            if (++counter >= resultNum) {
+                break;
+            }
         }
 
         return results;
@@ -268,7 +317,7 @@ public class ExportMgr {
         readLock();
         try {
             int counter = 0;
-            for (ExportJob job : idToJob.values()) {
+            for (ExportJob job : exportIdToJob.values()) {
                 // check auth
                 if (isJobShowable(job)) {
                     exportJobInfos.add(composeExportJobInfo(job));
@@ -305,11 +354,11 @@ public class ExportMgr {
                 return false;
             }
             if (!Env.getCurrentEnv().getAccessManager().checkDbPriv(ConnectContext.get(),
-                    db.getFullName(), PrivPredicate.SHOW)) {
+                    InternalCatalog.INTERNAL_CATALOG_NAME, db.getFullName(), PrivPredicate.SHOW)) {
                 return false;
             }
         } else {
-            if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ConnectContext.get(),
+            if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ConnectContext.get(), tableName.getCtl(),
                     tableName.getDb(), tableName.getTbl(),
                     PrivPredicate.SHOW)) {
                 return false;
@@ -329,7 +378,7 @@ public class ExportMgr {
 
         // task infos
         Map<String, Object> infoMap = Maps.newHashMap();
-        List<String> partitions = job.getPartitions();
+        List<String> partitions = job.getPartitionNames();
         if (partitions == null) {
             partitions = Lists.newArrayList();
             partitions.add("*");
@@ -337,19 +386,23 @@ public class ExportMgr {
         infoMap.put("db", job.getTableName().getDb());
         infoMap.put("tbl", job.getTableName().getTbl());
         if (job.getWhereExpr() != null) {
-            infoMap.put("where expr", job.getWhereExpr().toMySql());
+            infoMap.put("where expr", job.getWhereExpr().toSql());
         }
         infoMap.put("partitions", partitions);
         infoMap.put("broker", job.getBrokerDesc().getName());
-        infoMap.put("column separator", job.getColumnSeparator());
-        infoMap.put("line delimiter", job.getLineDelimiter());
-        infoMap.put("exec mem limit", job.getExecMemLimit());
+        infoMap.put("column_separator", job.getColumnSeparator());
+        infoMap.put("format", job.getFormat());
+        infoMap.put("with_bom", job.getWithBom());
+        infoMap.put("line_delimiter", job.getLineDelimiter());
         infoMap.put("columns", job.getColumns());
-        infoMap.put("coord num", job.getCoordList().size());
-        infoMap.put("tablet num", job.getTabletLocations() == null ? -1 : job.getTabletLocations().size());
+        infoMap.put("tablet_num", job.getTabletsNum());
+        infoMap.put("max_file_size", job.getMaxFileSize());
+        infoMap.put("delete_existing_files", job.getDeleteExistingFiles());
+        infoMap.put("parallelism", job.getParallelism());
+        infoMap.put("data_consistency", job.getDataConsistency());
         jobInfo.add(new Gson().toJson(infoMap));
         // path
-        jobInfo.add(job.getShowExportPath());
+        jobInfo.add(job.getExportPath());
 
         jobInfo.add(TimeUtils.longToTimeString(job.getCreateTimeMs()));
         jobInfo.add(TimeUtils.longToTimeString(job.getStartTimeMs()));
@@ -357,9 +410,16 @@ public class ExportMgr {
         jobInfo.add(job.getTimeoutSecond());
 
         // error msg
-        if (job.getState() == ExportJob.JobState.CANCELLED) {
+        if (job.getState() == ExportJobState.CANCELLED) {
             ExportFailMsg failMsg = job.getFailMsg();
             jobInfo.add("type:" + failMsg.getCancelType() + "; msg:" + failMsg.getMsg());
+        } else {
+            jobInfo.add(FeConstants.null_string);
+        }
+
+        // outfileInfo
+        if (job.getState() == ExportJobState.FINISHED) {
+            jobInfo.add(job.getOutfileInfo());
         } else {
             jobInfo.add(FeConstants.null_string);
         }
@@ -372,15 +432,21 @@ public class ExportMgr {
 
         writeLock();
         try {
-            Iterator<Map.Entry<Long, ExportJob>> iter = idToJob.entrySet().iterator();
+            Iterator<Map.Entry<Long, ExportJob>> iter = exportIdToJob.entrySet().iterator();
             while (iter.hasNext()) {
                 Map.Entry<Long, ExportJob> entry = iter.next();
                 ExportJob job = entry.getValue();
                 if ((currentTimeMs - job.getCreateTimeMs()) / 1000 > Config.history_job_keep_max_second
-                        && (job.getState() == ExportJob.JobState.CANCELLED
-                            || job.getState() == ExportJob.JobState.FINISHED)) {
+                        && (job.getState() == ExportJobState.CANCELLED
+                        || job.getState() == ExportJobState.FINISHED)) {
                     iter.remove();
-                    labelToJobId.remove(job.getLabel(), job.getId());
+                    Map<String, Long> labelJobs = dbTolabelToExportJobId.get(job.getDbId());
+                    if (labelJobs != null) {
+                        labelJobs.remove(job.getLabel());
+                        if (labelJobs.isEmpty()) {
+                            dbTolabelToExportJobId.remove(job.getDbId());
+                        }
+                    }
                 }
             }
         } finally {
@@ -397,21 +463,25 @@ public class ExportMgr {
         }
     }
 
-    public void replayUpdateJobState(long jobId, ExportJob.JobState newState) {
+    public void replayUpdateJobState(ExportJobStateTransfer stateTransfer) {
         readLock();
         try {
-            ExportJob job = idToJob.get(jobId);
-            job.updateState(newState, true);
+            ExportJob job = exportIdToJob.get(stateTransfer.getJobId());
+            job.replayExportJobState(stateTransfer.getState());
+            job.setStartTimeMs(stateTransfer.getStartTimeMs());
+            job.setFinishTimeMs(stateTransfer.getFinishTimeMs());
+            job.setFailMsg(stateTransfer.getFailMsg());
+            job.setOutfileInfo(stateTransfer.getOutFileInfo());
         } finally {
             readUnlock();
         }
     }
 
-    public long getJobNum(ExportJob.JobState state, long dbId) {
+    public long getJobNum(ExportJobState state, long dbId) {
         int size = 0;
         readLock();
         try {
-            for (ExportJob job : idToJob.values()) {
+            for (ExportJob job : exportIdToJob.values()) {
                 if (job.getState() == state && job.getDbId() == dbId) {
                     ++size;
                 }
@@ -422,14 +492,15 @@ public class ExportMgr {
         return size;
     }
 
-    public long getJobNum(ExportJob.JobState state) {
+    public long getJobNum(ExportJobState state) {
         int size = 0;
         readLock();
         try {
-            for (ExportJob job : idToJob.values()) {
-                if (!Env.getCurrentEnv().getAccessManager().checkDbPriv(ConnectContext.get(),
-                        Env.getCurrentEnv().getCatalogMgr().getDbNullable(job.getDbId()).getFullName(),
-                        PrivPredicate.LOAD)) {
+            for (ExportJob job : exportIdToJob.values()) {
+                if (!Env.getCurrentEnv().getAccessManager()
+                        .checkDbPriv(ConnectContext.get(), InternalCatalog.INTERNAL_CATALOG_NAME,
+                                Env.getCurrentEnv().getCatalogMgr().getDbNullable(job.getDbId()).getFullName(),
+                                PrivPredicate.LOAD)) {
                     continue;
                 }
 

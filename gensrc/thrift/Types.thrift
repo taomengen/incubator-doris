@@ -91,9 +91,13 @@ enum TPrimitiveType {
   DECIMAL64,
   DECIMAL128I,
   JSONB,
-  VARIANT,
   UNSUPPORTED,
-  LAMBDA_FUNCTION
+  VARIANT,
+  LAMBDA_FUNCTION,
+  AGG_STATE,
+  DECIMAL256,
+  IPV4,
+  IPV6
 }
 
 enum TTypeNodeType {
@@ -110,7 +114,17 @@ enum TStorageBackendType {
     HDFS,
     JFS,
     LOCAL,
-    OFS
+    OFS,
+    AZURE
+}
+
+// Enumerates the storage formats for inverted indexes in src_backends.
+// This enum is used to distinguish between different organizational methods
+// of inverted index data, affecting how the index is stored and accessed.
+enum TInvertedIndexFileStorageFormat {
+    DEFAULT, // Default format, unspecified storage method.
+    V1,      // Index per idx: Each index is stored separately based on its identifier.
+    V2       // Segment id per idx: Indexes are organized based on segment identifiers, grouping indexes by their associated segment.
 }
 
 struct TScalarType {
@@ -141,8 +155,11 @@ struct TTypeNode {
     // only used for structs; has struct_fields.size() corresponding child types
     3: optional list<TStructField> struct_fields
 
-    // only used for complex types, such as array, map and etc.
-    4: optional list<bool> contains_nulls
+    // old version used for array
+    4: optional bool contains_null
+
+    // update for map/struct type
+    5: optional list<bool> contains_nulls
 }
 
 // A flattened representation of a tree of column types obtained by depth-first
@@ -157,6 +174,10 @@ struct TTypeDesc {
     1: list<TTypeNode> types
     2: optional bool is_nullable
     3: optional i64  byte_size
+    4: optional list<TTypeDesc> sub_types
+    5: optional bool result_is_nullable
+    6: optional string function_name
+    7: optional i32 be_exec_version
 }
 
 enum TAggregationType {
@@ -211,14 +232,21 @@ enum TTaskType {
     NOTIFY_UPDATE_STORAGE_POLICY, // deprecated
     PUSH_COOLDOWN_CONF,
     PUSH_STORAGE_POLICY,
-    ALTER_INVERTED_INDEX
+    ALTER_INVERTED_INDEX,
+    GC_BINLOG,
+    CLEAN_TRASH,
+    UPDATE_VISIBLE_VERSION,
+    CLEAN_UDF_CACHE,
+
+    // CLOUD
+    CALCULATE_DELETE_BITMAP = 1000
 }
 
 enum TStmtType {
   QUERY,
   DDL,  // Data definition, e.g. CREATE TABLE (includes read-only functions e.g. SHOW)
   DML,  // Data modification e.g. INSERT
-  EXPLAIN   // EXPLAIN 
+  EXPLAIN   // EXPLAIN
 }
 
 // level of verboseness for "explain" output
@@ -299,6 +327,8 @@ enum TFunctionBinaryType {
   RPC,
 
   JAVA_UDF,
+
+  AGG_STATE
 }
 
 // Represents a fully qualified function name.
@@ -365,11 +395,31 @@ struct TFunction {
   11: optional i64 id
   12: optional string checksum
   13: optional bool vectorized = false
+  14: optional bool is_udtf_function = false
+  15: optional bool is_static_load = false
+  16: optional i64 expiration_time //minutes
 }
 
 enum TJdbcOperation {
     READ,
     WRITE
+}
+
+enum TOdbcTableType {
+    MYSQL,
+    ORACLE,
+    POSTGRESQL,
+    SQLSERVER,
+    REDIS,
+    MONGODB,
+    CLICKHOUSE,
+    SAP_HANA,
+    TRINO,
+    PRESTO,
+    OCEANBASE,
+    OCEANBASE_ORACLE,
+    NEBULA, // Deprecated
+    DB2
 }
 
 struct TJdbcExecutorCtorParams {
@@ -393,6 +443,16 @@ struct TJdbcExecutorCtorParams {
 
   // "/home/user/mysql-connector-java-5.1.47.jar"
   8: optional string driver_path
+
+  9: optional TOdbcTableType table_type
+
+  10: optional i32 connection_pool_min_size
+  11: optional i32 connection_pool_max_size
+  12: optional i32 connection_pool_max_wait_time
+  13: optional i32 connection_pool_max_life_time
+  14: optional i32 connection_pool_cache_clear_time
+  15: optional bool connection_pool_keep_alive
+  16: optional i64 catalog_id
 }
 
 struct TJavaUdfExecutorCtorParams {
@@ -424,7 +484,7 @@ struct TJavaUdfExecutorCtorParams {
   9: optional i64 output_intermediate_state_ptr
 
   10: optional i64 batch_size_ptr
-  
+
   // this is used to pass place or places to FE, which could help us call jni
   // only once and can process a batch size data in JAVA-Udaf
   11: optional i64 input_places_ptr
@@ -549,7 +609,7 @@ enum TLoadJobState {
     LOADING,
     FINISHED,
     CANCELLED
-}   
+}
 
 enum TEtlState {
 	RUNNING,
@@ -571,17 +631,9 @@ enum TTableType {
     HUDI_TABLE,
     JDBC_TABLE,
     TEST_EXTERNAL_TABLE,
-}
-
-enum TOdbcTableType {
-    MYSQL,
-    ORACLE,
-    POSTGRESQL,
-    SQLSERVER,
-    REDIS,
-    MONGODB,
-    CLICKHOUSE,
-    SAP_HANA
+    MAX_COMPUTE_TABLE,
+    LAKESOUL_TABLE,
+    TRINO_CONNECTOR_TABLE
 }
 
 enum TKeysType {
@@ -600,6 +652,17 @@ struct TBackend {
     1: required string host
     2: required TPort be_port
     3: required TPort http_port
+    4: optional TPort brpc_port
+    5: optional bool is_alive
+    6: optional i64 id
+}
+
+struct TReplicaInfo {
+    1: required string host
+    2: required TPort  be_port
+    3: required TPort  http_port
+    4: required TPort  brpc_port
+    5: required TReplicaId replica_id
 }
 
 struct TResourceInfo {
@@ -620,6 +683,7 @@ enum TFileType {
     FILE_STREAM,    // file content is streaming in the buffer
     FILE_S3,
     FILE_HDFS,
+    FILE_NET,       // read file by network, such as http
 }
 
 struct TTabletCommitInfo {
@@ -627,7 +691,7 @@ struct TTabletCommitInfo {
     2: required i64 backendId
     // Every load job should check if the global dict is valid, if the global dict
     // is invalid then should sent the invalid column names to FE
-    3: optional list<string> invalid_dict_cols  
+    3: optional list<string> invalid_dict_cols
 }
 
 struct TErrorTabletInfo {
@@ -644,6 +708,7 @@ enum TLoadType {
 enum TLoadSourceType {
     RAW,
     KAFKA,
+    MULTI_TABLE,
 }
 
 enum TMergeType {
@@ -654,7 +719,24 @@ enum TMergeType {
 
 enum TSortType {
     LEXICAL,
-    ZORDER, 
+    ZORDER,
+}
+
+enum TMetadataType {
+  ICEBERG,
+  BACKENDS,
+  FRONTENDS,
+  CATALOGS,
+  FRONTENDS_DISKS,
+  MATERIALIZED_VIEWS,
+  JOBS,
+  TASKS,
+  WORKLOAD_SCHED_POLICY,
+  PARTITIONS;
+}
+
+enum TIcebergQueryType {
+  SNAPSHOTS
 }
 
 // represent a user identity

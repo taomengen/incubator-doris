@@ -17,107 +17,102 @@
 
 #include "exchange_sink_buffer.h"
 
-#include <google/protobuf/stubs/common.h>
+#include <brpc/controller.h>
+#include <butil/errno.h>
+#include <butil/iobuf_inl.h>
+#include <fmt/format.h>
+#include <gen_cpp/Types_types.h>
+#include <glog/logging.h>
+#include <google/protobuf/stubs/callback.h>
+#include <stddef.h>
 
 #include <atomic>
+#include <cstdint>
+#include <exception>
+#include <functional>
 #include <memory>
+#include <ostream>
+#include <utility>
 
 #include "common/status.h"
+#include "pipeline/exec/exchange_sink_operator.h"
 #include "pipeline/pipeline_fragment_context.h"
-#include "service/brpc.h"
+#include "runtime/exec_env.h"
+#include "runtime/thread_context.h"
+#include "service/backend_options.h"
 #include "util/proto_util.h"
+#include "util/time.h"
 #include "vec/sink/vdata_stream_sender.h"
 
-namespace doris::pipeline {
-template <typename T>
-class SelfDeleteClosure : public google::protobuf::Closure {
-public:
-    SelfDeleteClosure(InstanceLoId id, bool eos, vectorized::BroadcastPBlockHolder* data = nullptr)
-            : _id(id), _eos(eos), _data(data) {}
-    ~SelfDeleteClosure() override = default;
-    SelfDeleteClosure(const SelfDeleteClosure& other) = delete;
-    SelfDeleteClosure& operator=(const SelfDeleteClosure& other) = delete;
-    void addFailedHandler(std::function<void(const InstanceLoId&, const std::string&)> fail_fn) {
-        _fail_fn = std::move(fail_fn);
-    }
-    void addSuccessHandler(std::function<void(const InstanceLoId&, const bool&, const T&)> suc_fn) {
-        _suc_fn = suc_fn;
-    }
+namespace doris {
 
-    void Run() noexcept override {
-        std::unique_ptr<SelfDeleteClosure> self_guard(this);
-        try {
-            if (cntl.Failed()) {
-                std::string err = fmt::format(
-                        "failed to send brpc when exchange, error={}, error_text={}, client: {}, "
-                        "latency = {}",
-                        berror(cntl.ErrorCode()), cntl.ErrorText(), BackendOptions::get_localhost(),
-                        cntl.latency_us());
-                _fail_fn(_id, err);
-            } else {
-                _suc_fn(_id, _eos, result);
-            }
-            if (_data) {
-                _data->unref();
-            }
-        } catch (const std::exception& exp) {
-            LOG(FATAL) << "brpc callback error: " << exp.what();
-        } catch (...) {
-            LOG(FATAL) << "brpc callback error.";
-        }
+namespace vectorized {
+BroadcastPBlockHolder::~BroadcastPBlockHolder() {
+    // lock the parent queue, if the queue could lock success, then return the block
+    // to the queue, to reuse the block
+    std::shared_ptr<BroadcastPBlockHolderMemLimiter> limiter = _parent_creator.lock();
+    if (limiter != nullptr) {
+        limiter->release(*this);
     }
+    // If the queue already deconstruted, then release pblock automatically since it
+    // is a unique ptr.
+}
 
-    brpc::Controller cntl;
-    T result;
+void BroadcastPBlockHolderMemLimiter::acquire(BroadcastPBlockHolder& holder) {
+    std::unique_lock l(_holders_lock);
+    DCHECK(_broadcast_dependency != nullptr);
+    holder.set_parent_creator(shared_from_this());
+    auto size = holder._pblock->column_values().size();
+    _total_queue_buffer_size += size;
+    _total_queue_blocks_count++;
+    if (_total_queue_buffer_size >= config::exchg_node_buffer_size_bytes ||
+        _total_queue_blocks_count >= config::num_broadcast_buffer) {
+        _broadcast_dependency->block();
+    }
+}
 
-private:
-    std::function<void(const InstanceLoId&, const std::string&)> _fail_fn;
-    std::function<void(const InstanceLoId&, const bool&, const T&)> _suc_fn;
-    InstanceLoId _id;
-    bool _eos;
-    vectorized::BroadcastPBlockHolder* _data;
-};
+void BroadcastPBlockHolderMemLimiter::release(const BroadcastPBlockHolder& holder) {
+    std::unique_lock l(_holders_lock);
+    DCHECK(_broadcast_dependency != nullptr);
+    auto size = holder._pblock->column_values().size();
+    _total_queue_buffer_size -= size;
+    _total_queue_blocks_count--;
+    if (_total_queue_buffer_size <= 0) {
+        _broadcast_dependency->set_ready();
+    }
+}
+
+} // namespace vectorized
+
+namespace pipeline {
 
 ExchangeSinkBuffer::ExchangeSinkBuffer(PUniqueId query_id, PlanNodeId dest_node_id, int send_id,
-                                       int be_number, PipelineFragmentContext* context)
-        : _is_finishing(false),
+                                       int be_number, RuntimeState* state,
+                                       ExchangeSinkLocalState* parent)
+        : HasTaskExecutionCtx(state),
+          _queue_capacity(0),
+          _is_finishing(false),
           _query_id(query_id),
           _dest_node_id(dest_node_id),
           _sender_id(send_id),
           _be_number(be_number),
-          _context(context) {}
-
-ExchangeSinkBuffer::~ExchangeSinkBuffer() = default;
+          _state(state),
+          _context(state->get_query_ctx()),
+          _parent(parent) {}
 
 void ExchangeSinkBuffer::close() {
-    for (const auto& pair : _instance_to_request) {
-        if (pair.second) {
-            pair.second->release_finst_id();
-            pair.second->release_query_id();
-            delete pair.second;
-        }
-    }
-    _instance_to_request.clear();
+    // Could not clear the queue here, because there maybe a running rpc want to
+    // get a request from the queue, and clear method will release the request
+    // and it will core.
+    //_instance_to_broadcast_package_queue.clear();
+    //_instance_to_package_queue.clear();
+    //_instance_to_request.clear();
 }
 
-bool ExchangeSinkBuffer::can_write() const {
-    size_t max_package_size = 64 * _instance_to_package_queue.size();
-    size_t total_package_size = 0;
-    for (auto& [_, q] : _instance_to_package_queue) {
-        total_package_size += q.size();
+void ExchangeSinkBuffer::_set_ready_to_finish(bool all_done) {
+    if (_finish_dependency && _should_stop && all_done) {
+        _finish_dependency->set_ready();
     }
-    return total_package_size <= max_package_size;
-}
-
-bool ExchangeSinkBuffer::is_pending_finish() const {
-    for (auto& pair : _instance_to_package_queue_mutex) {
-        std::unique_lock<std::mutex> lock(*(pair.second));
-        auto& id = pair.first;
-        if (!_instance_to_sending_by_pipeline.at(id)) {
-            return true;
-        }
-    }
-    return false;
 }
 
 void ExchangeSinkBuffer::register_sink(TUniqueId fragment_instance_id) {
@@ -133,30 +128,47 @@ void ExchangeSinkBuffer::register_sink(TUniqueId fragment_instance_id) {
     _instance_to_package_queue[low_id] = std::queue<TransmitInfo, std::list<TransmitInfo>>();
     _instance_to_broadcast_package_queue[low_id] =
             std::queue<BroadcastTransmitInfo, std::list<BroadcastTransmitInfo>>();
+    _queue_capacity =
+            config::exchg_buffer_queue_capacity_factor * _instance_to_package_queue.size();
     PUniqueId finst_id;
     finst_id.set_hi(fragment_instance_id.hi);
     finst_id.set_lo(fragment_instance_id.lo);
-    _instance_to_finst_id[low_id] = finst_id;
-    _instance_to_sending_by_pipeline[low_id] = true;
+    _rpc_channel_is_idle[low_id] = true;
+    _instance_to_rpc_ctx[low_id] = {};
+    _instance_to_receiver_eof[low_id] = false;
+    _instance_to_rpc_time[low_id] = 0;
+    _construct_request(low_id, finst_id);
 }
 
 Status ExchangeSinkBuffer::add_block(TransmitInfo&& request) {
     if (_is_finishing) {
         return Status::OK();
     }
-    TUniqueId ins_id = request.channel->_fragment_instance_id;
+    auto ins_id = request.channel->_fragment_instance_id.lo;
+    if (_is_receiver_eof(ins_id)) {
+        return Status::EndOfFile("receiver eof");
+    }
     bool send_now = false;
     {
-        std::unique_lock<std::mutex> lock(*_instance_to_package_queue_mutex[ins_id.lo]);
+        std::unique_lock<std::mutex> lock(*_instance_to_package_queue_mutex[ins_id]);
         // Do not have in process rpc, directly send
-        if (_instance_to_sending_by_pipeline[ins_id.lo]) {
+        if (_rpc_channel_is_idle[ins_id]) {
             send_now = true;
-            _instance_to_sending_by_pipeline[ins_id.lo] = false;
+            _rpc_channel_is_idle[ins_id] = false;
+            _busy_channels++;
         }
-        _instance_to_package_queue[ins_id.lo].emplace(std::move(request));
+        if (request.block) {
+            RETURN_IF_ERROR(
+                    BeExecVersionManager::check_be_exec_version(request.block->be_exec_version()));
+        }
+        _instance_to_package_queue[ins_id].emplace(std::move(request));
+        _total_queue_size++;
+        if (_queue_dependency && _total_queue_size > _queue_capacity) {
+            _queue_dependency->block();
+        }
     }
     if (send_now) {
-        RETURN_IF_ERROR(_send_rpc(ins_id.lo));
+        RETURN_IF_ERROR(_send_rpc(ins_id));
     }
 
     return Status::OK();
@@ -166,20 +178,27 @@ Status ExchangeSinkBuffer::add_block(BroadcastTransmitInfo&& request) {
     if (_is_finishing) {
         return Status::OK();
     }
-    TUniqueId ins_id = request.channel->_fragment_instance_id;
+    auto ins_id = request.channel->_fragment_instance_id.lo;
+    if (_is_receiver_eof(ins_id)) {
+        return Status::EndOfFile("receiver eof");
+    }
     bool send_now = false;
-    request.block_holder->ref();
     {
-        std::unique_lock<std::mutex> lock(*_instance_to_package_queue_mutex[ins_id.lo]);
+        std::unique_lock<std::mutex> lock(*_instance_to_package_queue_mutex[ins_id]);
         // Do not have in process rpc, directly send
-        if (_instance_to_sending_by_pipeline[ins_id.lo]) {
+        if (_rpc_channel_is_idle[ins_id]) {
             send_now = true;
-            _instance_to_sending_by_pipeline[ins_id.lo] = false;
+            _rpc_channel_is_idle[ins_id] = false;
+            _busy_channels++;
         }
-        _instance_to_broadcast_package_queue[ins_id.lo].emplace(std::move(request));
+        if (request.block_holder->get_block()) {
+            RETURN_IF_ERROR(BeExecVersionManager::check_be_exec_version(
+                    request.block_holder->get_block()->be_exec_version()));
+        }
+        _instance_to_broadcast_package_queue[ins_id].emplace(request);
     }
     if (send_now) {
-        RETURN_IF_ERROR(_send_rpc(ins_id.lo));
+        RETURN_IF_ERROR(_send_rpc(ins_id));
     }
 
     return Status::OK();
@@ -188,112 +207,182 @@ Status ExchangeSinkBuffer::add_block(BroadcastTransmitInfo&& request) {
 Status ExchangeSinkBuffer::_send_rpc(InstanceLoId id) {
     std::unique_lock<std::mutex> lock(*_instance_to_package_queue_mutex[id]);
 
+    DCHECK(_rpc_channel_is_idle[id] == false);
+
     std::queue<TransmitInfo, std::list<TransmitInfo>>& q = _instance_to_package_queue[id];
     std::queue<BroadcastTransmitInfo, std::list<BroadcastTransmitInfo>>& broadcast_q =
             _instance_to_broadcast_package_queue[id];
 
     if (_is_finishing) {
-        _instance_to_sending_by_pipeline[id] = true;
+        _turn_off_channel(id);
         return Status::OK();
     }
 
     if (!q.empty()) {
         // If we have data to shuffle which is not broadcasted
         auto& request = q.front();
-        if (!_instance_to_request[id]) {
-            _construct_request(id);
-        }
-        auto brpc_request = _instance_to_request[id];
+        auto& brpc_request = _instance_to_request[id];
         brpc_request->set_eos(request.eos);
         brpc_request->set_packet_seq(_instance_to_seq[id]++);
-        if (request.block) {
+        if (request.block && !request.block->column_metas().empty()) {
             brpc_request->set_allocated_block(request.block.get());
         }
-        auto* _closure = new SelfDeleteClosure<PTransmitDataResult>(id, request.eos, nullptr);
-        _closure->cntl.set_timeout_ms(request.channel->_brpc_timeout_ms);
-        _closure->addFailedHandler(
-                [&](const InstanceLoId& id, const std::string& err) { _failed(id, err); });
-        _closure->addSuccessHandler([&](const InstanceLoId& id, const bool& eos,
-                                        const PTransmitDataResult& result) {
-            Status s = Status(result.status());
-            if (!s.ok()) {
+        if (!request.exec_status.ok()) {
+            request.exec_status.to_protobuf(brpc_request->mutable_exec_status());
+        }
+        auto send_callback = request.channel->get_send_callback(id, request.eos);
+
+        _instance_to_rpc_ctx[id]._send_callback = send_callback;
+        _instance_to_rpc_ctx[id].is_cancelled = false;
+
+        send_callback->cntl_->set_timeout_ms(request.channel->_brpc_timeout_ms);
+        if (config::exchange_sink_ignore_eovercrowded) {
+            send_callback->cntl_->ignore_eovercrowded();
+        }
+        send_callback->addFailedHandler([&, weak_task_ctx = weak_task_exec_ctx()](
+                                                const InstanceLoId& id, const std::string& err) {
+            auto task_lock = weak_task_ctx.lock();
+            if (task_lock == nullptr) {
+                // This means ExchangeSinkBuffer Ojbect already destroyed, not need run failed any more.
+                return;
+            }
+            // attach task for memory tracker and query id when core
+            SCOPED_ATTACH_TASK(_state);
+            _failed(id, err);
+        });
+        send_callback->start_rpc_time = GetCurrentTimeNanos();
+        send_callback->addSuccessHandler([&, weak_task_ctx = weak_task_exec_ctx()](
+                                                 const InstanceLoId& id, const bool& eos,
+                                                 const PTransmitDataResult& result,
+                                                 const int64_t& start_rpc_time) {
+            auto task_lock = weak_task_ctx.lock();
+            if (task_lock == nullptr) {
+                // This means ExchangeSinkBuffer Ojbect already destroyed, not need run failed any more.
+                return;
+            }
+            // attach task for memory tracker and query id when core
+            SCOPED_ATTACH_TASK(_state);
+            set_rpc_time(id, start_rpc_time, result.receive_time());
+            Status s(Status::create(result.status()));
+            if (s.is<ErrorCode::END_OF_FILE>()) {
+                _set_receiver_eof(id);
+            } else if (!s.ok()) {
                 _failed(id,
                         fmt::format("exchange req success but status isn't ok: {}", s.to_string()));
             } else if (eos) {
                 _ended(id);
             } else {
-                _send_rpc(id);
+                static_cast<void>(_send_rpc(id));
             }
         });
         {
-            SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(ExecEnv::GetInstance()->orphan_mem_tracker());
+            auto send_remote_block_closure =
+                    AutoReleaseClosure<PTransmitDataParams,
+                                       pipeline::ExchangeSendCallback<PTransmitDataResult>>::
+                            create_unique(brpc_request, send_callback);
             if (enable_http_send_block(*brpc_request)) {
-                RETURN_IF_ERROR(transmit_block_http(_context->get_runtime_state(), _closure,
-                                                    *brpc_request,
-                                                    request.channel->_brpc_dest_addr));
+                RETURN_IF_ERROR(transmit_block_httpv2(_context->exec_env(),
+                                                      std::move(send_remote_block_closure),
+                                                      request.channel->_brpc_dest_addr));
             } else {
-                transmit_block(*request.channel->_brpc_stub, _closure, *brpc_request);
+                transmit_blockv2(*request.channel->_brpc_stub,
+                                 std::move(send_remote_block_closure));
             }
         }
         if (request.block) {
-            brpc_request->release_block();
+            static_cast<void>(brpc_request->release_block());
         }
         q.pop();
+        _total_queue_size--;
+        if (_queue_dependency && _total_queue_size <= _queue_capacity) {
+            _queue_dependency->set_ready();
+        }
     } else if (!broadcast_q.empty()) {
         // If we have data to shuffle which is broadcasted
         auto& request = broadcast_q.front();
-        if (!_instance_to_request[id]) {
-            _construct_request(id);
-        }
-        auto brpc_request = _instance_to_request[id];
+        auto& brpc_request = _instance_to_request[id];
         brpc_request->set_eos(request.eos);
         brpc_request->set_packet_seq(_instance_to_seq[id]++);
-        if (request.block_holder->get_block()) {
+        if (request.block_holder->get_block() &&
+            !request.block_holder->get_block()->column_metas().empty()) {
             brpc_request->set_allocated_block(request.block_holder->get_block());
         }
-        auto* _closure =
-                new SelfDeleteClosure<PTransmitDataResult>(id, request.eos, request.block_holder);
-        _closure->cntl.set_timeout_ms(request.channel->_brpc_timeout_ms);
-        _closure->addFailedHandler(
-                [&](const InstanceLoId& id, const std::string& err) { _failed(id, err); });
-        _closure->addSuccessHandler([&](const InstanceLoId& id, const bool& eos,
-                                        const PTransmitDataResult& result) {
-            Status s = Status(result.status());
-            if (!s.ok()) {
+        auto send_callback = request.channel->get_send_callback(id, request.eos);
+
+        ExchangeRpcContext rpc_ctx;
+        rpc_ctx._send_callback = send_callback;
+        rpc_ctx.is_cancelled = false;
+        _instance_to_rpc_ctx[id] = rpc_ctx;
+
+        send_callback->cntl_->set_timeout_ms(request.channel->_brpc_timeout_ms);
+        if (config::exchange_sink_ignore_eovercrowded) {
+            send_callback->cntl_->ignore_eovercrowded();
+        }
+        send_callback->addFailedHandler([&, weak_task_ctx = weak_task_exec_ctx()](
+                                                const InstanceLoId& id, const std::string& err) {
+            auto task_lock = weak_task_ctx.lock();
+            if (task_lock == nullptr) {
+                // This means ExchangeSinkBuffer Ojbect already destroyed, not need run failed any more.
+                return;
+            }
+            // attach task for memory tracker and query id when core
+            SCOPED_ATTACH_TASK(_state);
+            _failed(id, err);
+        });
+        send_callback->start_rpc_time = GetCurrentTimeNanos();
+        send_callback->addSuccessHandler([&, weak_task_ctx = weak_task_exec_ctx()](
+                                                 const InstanceLoId& id, const bool& eos,
+                                                 const PTransmitDataResult& result,
+                                                 const int64_t& start_rpc_time) {
+            auto task_lock = weak_task_ctx.lock();
+            if (task_lock == nullptr) {
+                // This means ExchangeSinkBuffer Ojbect already destroyed, not need run failed any more.
+                return;
+            }
+            // attach task for memory tracker and query id when core
+            SCOPED_ATTACH_TASK(_state);
+            set_rpc_time(id, start_rpc_time, result.receive_time());
+            Status s(Status::create(result.status()));
+            if (s.is<ErrorCode::END_OF_FILE>()) {
+                _set_receiver_eof(id);
+            } else if (!s.ok()) {
                 _failed(id,
                         fmt::format("exchange req success but status isn't ok: {}", s.to_string()));
             } else if (eos) {
                 _ended(id);
             } else {
-                _send_rpc(id);
+                static_cast<void>(_send_rpc(id));
             }
         });
         {
-            SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(ExecEnv::GetInstance()->orphan_mem_tracker());
+            auto send_remote_block_closure =
+                    AutoReleaseClosure<PTransmitDataParams,
+                                       pipeline::ExchangeSendCallback<PTransmitDataResult>>::
+                            create_unique(brpc_request, send_callback);
             if (enable_http_send_block(*brpc_request)) {
-                RETURN_IF_ERROR(transmit_block_http(_context->get_runtime_state(), _closure,
-                                                    *brpc_request,
-                                                    request.channel->_brpc_dest_addr));
+                RETURN_IF_ERROR(transmit_block_httpv2(_context->exec_env(),
+                                                      std::move(send_remote_block_closure),
+                                                      request.channel->_brpc_dest_addr));
             } else {
-                transmit_block(*request.channel->_brpc_stub, _closure, *brpc_request);
+                transmit_blockv2(*request.channel->_brpc_stub,
+                                 std::move(send_remote_block_closure));
             }
         }
         if (request.block_holder->get_block()) {
-            brpc_request->release_block();
+            static_cast<void>(brpc_request->release_block());
         }
         broadcast_q.pop();
     } else {
-        _instance_to_sending_by_pipeline[id] = true;
-        return Status::OK();
+        _turn_off_channel(id);
     }
 
     return Status::OK();
 }
 
-void ExchangeSinkBuffer::_construct_request(InstanceLoId id) {
-    _instance_to_request[id] = new PTransmitDataParams();
-    _instance_to_request[id]->set_allocated_finst_id(&_instance_to_finst_id[id]);
-    _instance_to_request[id]->set_allocated_query_id(&_query_id);
+void ExchangeSinkBuffer::_construct_request(InstanceLoId id, PUniqueId finst_id) {
+    _instance_to_request[id] = std::make_shared<PTransmitDataParams>();
+    _instance_to_request[id]->mutable_finst_id()->CopyFrom(finst_id);
+    _instance_to_request[id]->mutable_query_id()->CopyFrom(_query_id);
 
     _instance_to_request[id]->set_node_id(_dest_node_id);
     _instance_to_request[id]->set_sender_id(_sender_id);
@@ -301,14 +390,105 @@ void ExchangeSinkBuffer::_construct_request(InstanceLoId id) {
 }
 
 void ExchangeSinkBuffer::_ended(InstanceLoId id) {
-    std::unique_lock<std::mutex> lock(*_instance_to_package_queue_mutex[id]);
-    _instance_to_sending_by_pipeline[id] = true;
+    if (!_instance_to_package_queue_mutex.template contains(id)) {
+        std::stringstream ss;
+        ss << "failed find the instance id:" << id
+           << " now mutex map size:" << _instance_to_package_queue_mutex.size();
+        for (const auto& p : _instance_to_package_queue_mutex) {
+            ss << " key:" << p.first << " value:" << p.second << "\n";
+        }
+        LOG(INFO) << ss.str();
+
+        LOG(FATAL) << "not find the instance id";
+        __builtin_unreachable();
+    } else {
+        std::unique_lock<std::mutex> lock(*_instance_to_package_queue_mutex[id]);
+        _turn_off_channel(id);
+    }
 }
 
 void ExchangeSinkBuffer::_failed(InstanceLoId id, const std::string& err) {
     _is_finishing = true;
-    _context->cancel(PPlanFragmentCancelReason::INTERNAL_ERROR, err);
-    _ended(id);
-};
+    _context->cancel(Status::Cancelled(err));
+    std::unique_lock<std::mutex> lock(*_instance_to_package_queue_mutex[id]);
+    _turn_off_channel(id, true);
+}
 
-} // namespace doris::pipeline
+void ExchangeSinkBuffer::_set_receiver_eof(InstanceLoId id) {
+    std::unique_lock<std::mutex> lock(*_instance_to_package_queue_mutex[id]);
+    _instance_to_receiver_eof[id] = true;
+    _turn_off_channel(id, true);
+    std::queue<BroadcastTransmitInfo, std::list<BroadcastTransmitInfo>> empty;
+    swap(empty, _instance_to_broadcast_package_queue[id]);
+}
+
+bool ExchangeSinkBuffer::_is_receiver_eof(InstanceLoId id) {
+    std::unique_lock<std::mutex> lock(*_instance_to_package_queue_mutex[id]);
+    return _instance_to_receiver_eof[id];
+}
+
+void ExchangeSinkBuffer::_turn_off_channel(InstanceLoId id, bool cleanup) {
+    if (!_rpc_channel_is_idle[id]) {
+        _rpc_channel_is_idle[id] = true;
+        auto all_done = _busy_channels.fetch_sub(1) == 1;
+        _set_ready_to_finish(all_done);
+        if (cleanup && all_done) {
+            auto weak_task_ctx = weak_task_exec_ctx();
+            if (auto pip_ctx = weak_task_ctx.lock()) {
+                _parent->set_reach_limit();
+            }
+        }
+    }
+}
+
+void ExchangeSinkBuffer::get_max_min_rpc_time(int64_t* max_time, int64_t* min_time) {
+    int64_t local_max_time = 0;
+    int64_t local_min_time = INT64_MAX;
+    for (auto& [id, time] : _instance_to_rpc_time) {
+        if (time != 0) {
+            local_max_time = std::max(local_max_time, time);
+            local_min_time = std::min(local_min_time, time);
+        }
+    }
+    *max_time = local_max_time;
+    *min_time = local_min_time == INT64_MAX ? 0 : local_min_time;
+}
+
+int64_t ExchangeSinkBuffer::get_sum_rpc_time() {
+    int64_t sum_time = 0;
+    for (auto& [id, time] : _instance_to_rpc_time) {
+        sum_time += time;
+    }
+    return sum_time;
+}
+
+void ExchangeSinkBuffer::set_rpc_time(InstanceLoId id, int64_t start_rpc_time,
+                                      int64_t receive_rpc_time) {
+    _rpc_count++;
+    int64_t rpc_spend_time = receive_rpc_time - start_rpc_time;
+    DCHECK(_instance_to_rpc_time.find(id) != _instance_to_rpc_time.end());
+    if (rpc_spend_time > 0) {
+        _instance_to_rpc_time[id] += rpc_spend_time;
+    }
+}
+
+void ExchangeSinkBuffer::update_profile(RuntimeProfile* profile) {
+    auto* _max_rpc_timer = ADD_TIMER(profile, "RpcMaxTime");
+    auto* _min_rpc_timer = ADD_TIMER(profile, "RpcMinTime");
+    auto* _sum_rpc_timer = ADD_TIMER(profile, "RpcSumTime");
+    auto* _count_rpc = ADD_COUNTER(profile, "RpcCount", TUnit::UNIT);
+    auto* _avg_rpc_timer = ADD_TIMER(profile, "RpcAvgTime");
+
+    int64_t max_rpc_time = 0, min_rpc_time = 0;
+    get_max_min_rpc_time(&max_rpc_time, &min_rpc_time);
+    _max_rpc_timer->set(max_rpc_time);
+    _min_rpc_timer->set(min_rpc_time);
+
+    _count_rpc->set(_rpc_count);
+    int64_t sum_time = get_sum_rpc_time();
+    _sum_rpc_timer->set(sum_time);
+    _avg_rpc_timer->set(sum_time / std::max(static_cast<int64_t>(1), _rpc_count.load()));
+}
+
+} // namespace pipeline
+} // namespace doris

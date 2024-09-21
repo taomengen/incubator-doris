@@ -17,37 +17,41 @@
 
 #pragma once
 
-#include <memory>
+#include <gen_cpp/segment_v2.pb.h>
+#include <glog/logging.h>
+#include <stddef.h>
+#include <stdint.h>
+
 #include <string>
+#include <utility>
 
 #include "common/status.h"
-#include "env/env.h"
-#include "gen_cpp/segment_v2.pb.h"
-#include "io/fs/file_reader.h"
-#include "io/fs/file_system.h"
+#include "io/fs/file_reader_writer_fwd.h"
 #include "olap/rowset/segment_v2/common.h"
 #include "olap/rowset/segment_v2/index_page.h"
 #include "olap/rowset/segment_v2/page_handle.h"
 #include "olap/rowset/segment_v2/page_pointer.h"
 #include "olap/rowset/segment_v2/parsed_page.h"
-#include "util/block_compression.h"
 #include "util/slice.h"
+#include "vec/data_types/data_type.h"
 
 namespace doris {
 
 class KeyCoder;
 class TypeInfo;
+class BlockCompressionCodec;
 
 namespace segment_v2 {
 
 class EncodingInfo;
-class IndexedColumnIterator;
 
 // thread-safe reader for IndexedColumn (see comments of `IndexedColumnWriter` to understand what IndexedColumn is)
 class IndexedColumnReader {
 public:
     explicit IndexedColumnReader(io::FileReaderSPtr file_reader, const IndexedColumnMetaPB& meta)
             : _file_reader(std::move(file_reader)), _meta(meta) {}
+
+    ~IndexedColumnReader();
 
     Status load(bool use_page_cache, bool kept_in_memory);
 
@@ -63,6 +67,7 @@ public:
 
     CompressionTypePB get_compression() const { return _meta.compression(); }
     uint64_t get_memory_size() const { return _mem_size; }
+    void set_is_pk_index(bool is_pk) { _is_pk_index = is_pk; }
 
 private:
     Status load_index_page(const PagePointerPB& pp, PageHandle* handle, IndexPageReader* reader);
@@ -89,6 +94,7 @@ private:
     const EncodingInfo* _encoding_info = nullptr;
     const KeyCoder* _value_key_coder = nullptr;
     uint64_t _mem_size = 0;
+    bool _is_pk_index = false;
 };
 
 class IndexedColumnIterator {
@@ -99,7 +105,7 @@ public:
               _value_iter(&reader->_value_index_reader) {}
 
     // Seek to the given ordinal entry. Entry 0 is the first entry.
-    // Return NotFound if provided seek point is past the end.
+    // Return Status::Error<ENTRY_NOT_FOUND> if provided seek point is past the end.
     // Return NotSupported for column without ordinal index.
     Status seek_to_ordinal(ordinal_t idx);
 
@@ -110,7 +116,7 @@ public:
     // Sets *exact_match to indicate whether the seek found the exact
     // key requested.
     //
-    // Return NotFound if the given key is greater than all keys in this column.
+    // Return Status::Error<ENTRY_NOT_FOUND> if the given key is greater than all keys in this column.
     // Return NotSupported for column without value index.
     Status seek_at_or_after(const void* key, bool* exact_match);
     Status seek_at_or_after(const std::string* key, bool* exact_match) {
@@ -130,7 +136,7 @@ public:
 private:
     Status _read_data_page(const PagePointer& pp);
 
-    const IndexedColumnReader* _reader;
+    const IndexedColumnReader* _reader = nullptr;
     // iterator for ordinal index page
     IndexPageIterator _ordinal_iter;
     // iterator for value index page

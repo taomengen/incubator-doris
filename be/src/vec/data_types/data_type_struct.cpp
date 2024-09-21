@@ -20,8 +20,28 @@
 
 #include "vec/data_types/data_type_struct.h"
 
+#include <ctype.h>
+#include <fmt/format.h>
+#include <gen_cpp/data.pb.h>
+#include <glog/logging.h>
+#include <string.h>
+
+#include <algorithm>
+#include <memory>
+#include <ostream>
+#include <typeinfo>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include "vec/columns/column.h"
 #include "vec/columns/column_const.h"
+#include "vec/columns/column_nullable.h"
 #include "vec/columns/column_struct.h"
+#include "vec/common/assert_cast.h"
+#include "vec/common/string_buffer.hpp"
+#include "vec/common/string_ref.h"
+#include "vec/io/reader_buffer.h"
 
 namespace doris::vectorized {
 
@@ -54,7 +74,9 @@ DataTypeStruct::DataTypeStruct(const DataTypes& elems_, const Strings& names_)
         : elems(elems_), names(names_), have_explicit_names(true) {
     size_t size = elems.size();
     if (names.size() != size) {
-        LOG(FATAL) << "Wrong number of names passed to constructor of DataTypeStruct";
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                               "Wrong number of names passed to constructor of DataTypeStruct");
+        __builtin_unreachable();
     }
 
     Status st = check_tuple_names(names);
@@ -69,79 +91,12 @@ std::string DataTypeStruct::do_get_name() const {
         if (i != 0) {
             s << ", ";
         }
+        s << names[i] << ":";
         s << elems[i]->get_name();
     }
     s << ")";
 
     return s.str();
-}
-
-bool next_slot_from_string(ReadBuffer& rb, StringRef& output, bool& is_name, bool& has_quota) {
-    StringRef element(rb.position(), 0);
-    has_quota = false;
-    is_name = false;
-    if (rb.eof()) {
-        return false;
-    }
-
-    // ltrim
-    while (!rb.eof() && isspace(*rb.position())) {
-        ++rb.position();
-        element.data = rb.position();
-    }
-
-    // parse string
-    if (*rb.position() == '"' || *rb.position() == '\'') {
-        const char str_sep = *rb.position();
-        size_t str_len = 1;
-        // search until next '"' or '\''
-        while (str_len < rb.count() && *(rb.position() + str_len) != str_sep) {
-            ++str_len;
-        }
-        // invalid string
-        if (str_len >= rb.count()) {
-            rb.position() = rb.end();
-            return false;
-        }
-        has_quota = true;
-        rb.position() += str_len + 1;
-        element.size += str_len + 1;
-    }
-
-    // parse element until separator ':' or ',' or end '}'
-    while (!rb.eof() && (*rb.position() != ':') && (*rb.position() != ',') &&
-           (rb.count() != 1 || *rb.position() != '}')) {
-        if (has_quota && !isspace(*rb.position())) {
-            return false;
-        }
-        ++rb.position();
-        ++element.size;
-    }
-    // invalid element
-    if (rb.eof()) {
-        return false;
-    }
-
-    if (*rb.position() == ':') {
-        is_name = true;
-    }
-
-    // adjust read buffer position to first char of next element
-    ++rb.position();
-
-    // rtrim
-    while (element.size > 0 && isspace(element.data[element.size - 1])) {
-        --element.size;
-    }
-
-    // trim '"' and '\'' for string
-    if (element.size >= 2 && (element.data[0] == '"' || element.data[0] == '\'') &&
-        element.data[0] == element.data[element.size - 1]) {
-        ++element.data;
-        element.size -= 2;
-    }
-    output = element;
-    return true;
 }
 
 Status DataTypeStruct::from_string(ReadBuffer& rb, IColumn* column) const {
@@ -176,13 +131,13 @@ Status DataTypeStruct::from_string(ReadBuffer& rb, IColumn* column) const {
         StringRef slot(rb.position(), rb.count());
         bool has_quota = false;
         bool is_name = false;
-        if (!next_slot_from_string(rb, slot, is_name, has_quota)) {
+        if (!DataTypeStructSerDe::next_slot_from_string(rb, slot, is_name, has_quota)) {
             return Status::InvalidArgument("Cannot read struct field from text '{}'",
                                            slot.to_string());
         }
         if (is_name) {
             std::string name = slot.to_string();
-            if (!next_slot_from_string(rb, slot, is_name, has_quota)) {
+            if (!DataTypeStructSerDe::next_slot_from_string(rb, slot, is_name, has_quota)) {
                 return Status::InvalidArgument("Cannot read struct field from text '{}'",
                                                slot.to_string());
             }
@@ -298,42 +253,6 @@ void DataTypeStruct::to_string(const IColumn& column, size_t row_num, BufferWrit
     ostr.write("}", 1);
 }
 
-static inline IColumn& extract_element_column(IColumn& column, size_t idx) {
-    return assert_cast<ColumnStruct&>(column).get_column(idx);
-}
-
-template <typename F>
-void add_element_safe(const DataTypes& elems, IColumn& column, F&& impl) {
-    /// We use the assumption that tuples of zero size do not exist.
-    size_t old_size = column.size();
-
-    try {
-        impl();
-
-        // Check that all columns now have the same size.
-        size_t new_size = column.size();
-
-        for (auto i = 0; i < elems.size(); i++) {
-            const auto& element_column = extract_element_column(column, i);
-            if (element_column.size() != new_size) {
-                // This is not a logical error because it may work with
-                // user-supplied data.
-                LOG(FATAL) << "Cannot read a tuple because not all elements are present";
-            }
-        }
-    } catch (...) {
-        for (auto i = 0; i < elems.size(); i++) {
-            auto& element_column = extract_element_column(column, i);
-
-            if (element_column.size() > old_size) {
-                element_column.pop_back(1);
-            }
-        }
-
-        throw;
-    }
-}
-
 MutableColumnPtr DataTypeStruct::create_column() const {
     size_t size = elems.size();
     MutableColumns tuple_columns(size);
@@ -344,15 +263,12 @@ MutableColumnPtr DataTypeStruct::create_column() const {
 }
 
 Field DataTypeStruct::get_default() const {
-    return Tuple();
-}
-
-void DataTypeStruct::insert_default_into(IColumn& column) const {
-    add_element_safe(elems, column, [&] {
-        for (auto i = 0; i < elems.size(); i++) {
-            elems[i]->insert_default_into(extract_element_column(column, i));
-        }
-    });
+    size_t size = elems.size();
+    Tuple t;
+    for (size_t i = 0; i < size; ++i) {
+        t.push_back(elems[i]->get_default());
+    }
+    return t;
 }
 
 bool DataTypeStruct::equals(const IDataType& rhs) const {
@@ -383,7 +299,9 @@ size_t DataTypeStruct::get_position_by_name(const String& name) const {
             return i;
         }
     }
-    LOG(FATAL) << "Struct doesn't have element with name '" + name + "'";
+    throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                           "Struct doesn't have element with name  " + name);
+    __builtin_unreachable();
 }
 
 std::optional<size_t> DataTypeStruct::try_get_position_by_name(const String& name) const {
@@ -397,14 +315,7 @@ std::optional<size_t> DataTypeStruct::try_get_position_by_name(const String& nam
 }
 
 String DataTypeStruct::get_name_by_position(size_t i) const {
-    if (i == 0 || i > names.size()) {
-        fmt::memory_buffer error_msg;
-        fmt::format_to(error_msg, "Index of tuple element ({}) if out range ([1, {}])", i,
-                       names.size());
-        LOG(FATAL) << fmt::to_string(error_msg);
-    }
-
-    return names[i - 1];
+    return names[i];
 }
 
 int64_t DataTypeStruct::get_uncompressed_serialized_bytes(const IColumn& column,
@@ -446,7 +357,9 @@ const char* DataTypeStruct::deserialize(const char* buf, IColumn* column,
 void DataTypeStruct::to_pb_column_meta(PColumnMeta* col_meta) const {
     IDataType::to_pb_column_meta(col_meta);
     for (size_t i = 0; i < elems.size(); ++i) {
-        elems[i]->to_pb_column_meta(col_meta->add_children());
+        auto child = col_meta->add_children();
+        child->set_name(names[i]);
+        elems[i]->to_pb_column_meta(child);
     }
 }
 

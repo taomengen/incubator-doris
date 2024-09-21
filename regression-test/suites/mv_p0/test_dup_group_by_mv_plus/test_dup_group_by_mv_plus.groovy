@@ -18,6 +18,7 @@
 import org.codehaus.groovy.runtime.IOGroovyMethods
 
 suite ("test_dup_group_by_mv_plus") {
+
     sql """ DROP TABLE IF EXISTS d_table; """
 
     sql """
@@ -40,6 +41,9 @@ suite ("test_dup_group_by_mv_plus") {
 
     sql "insert into d_table select -4,-4,-4,'d';"
 
+    sql """analyze table d_table with sync;"""
+    sql """set enable_stats=false;"""
+
     qt_select_star "select * from d_table order by k1;"
 
     explain {
@@ -53,4 +57,15 @@ suite ("test_dup_group_by_mv_plus") {
         contains "(k12sp)"
     }
     qt_select_mv_sub "select sum(k2+1) from d_table group by k1 order by k1;"
+
+    sql """set enable_stats=true;"""
+    explain {
+        sql("select k1,sum(k2+1) from d_table group by k1;")
+        contains "(k12sp)"
+    }
+
+    explain {
+        sql("select sum(k2+1) from d_table group by k1;")
+        contains "(k12sp)"
+    }
 }

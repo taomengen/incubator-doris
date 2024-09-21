@@ -17,59 +17,45 @@
 
 #include "io/fs/remote_file_system.h"
 
-#include "gutil/strings/stringpiece.h"
-#include "io/cache/block/cached_remote_file_reader.h"
-#include "io/cache/file_cache_manager.h"
-#include "io/fs/file_reader_options.h"
-#include "util/async_io.h"
+#include <glog/logging.h>
 
-namespace doris {
-namespace io {
+#include <algorithm>
 
-Status RemoteFileSystem::open_file(const Path& path, const FileReaderOptions& reader_options,
-                                   FileReaderSPtr* reader, IOContext* io_ctx) {
-    if (bthread_self() == 0) {
-        return open_file_impl(path, reader_options, reader, io_ctx);
-    }
-    Status s;
-    auto task = [&] { s = open_file_impl(path, reader_options, reader, io_ctx); };
-    AsyncIO::run_task(task, io::FileSystemType::S3);
-    return s;
+#include "common/config.h"
+#include "io/cache/cached_remote_file_reader.h"
+#include "io/fs/file_reader.h"
+#include "util/async_io.h" // IWYU pragma: keep
+
+namespace doris::io {
+
+Status RemoteFileSystem::upload(const Path& local_file, const Path& dest_file) {
+    auto dest_path = absolute_path(dest_file);
+    FILESYSTEM_M(upload_impl(local_file, dest_path));
 }
 
-Status RemoteFileSystem::open_file_impl(const Path& path, const FileReaderOptions& reader_options,
-                                        FileReaderSPtr* reader, IOContext* io_ctx) {
+Status RemoteFileSystem::batch_upload(const std::vector<Path>& local_files,
+                                      const std::vector<Path>& remote_files) {
+    std::vector<Path> remote_paths;
+    for (auto& path : remote_files) {
+        remote_paths.push_back(absolute_path(path));
+    }
+    FILESYSTEM_M(batch_upload_impl(local_files, remote_paths));
+}
+
+Status RemoteFileSystem::download(const Path& remote_file, const Path& local) {
+    auto remote_path = absolute_path(remote_file);
+    FILESYSTEM_M(download_impl(remote_path, local));
+}
+
+Status RemoteFileSystem::open_file_impl(const Path& path, FileReaderSPtr* reader,
+                                        const FileReaderOptions* opts) {
     FileReaderSPtr raw_reader;
-    RETURN_IF_ERROR(open_file(path, &raw_reader, io_ctx));
-    switch (reader_options.cache_type) {
-    case io::FileCachePolicy::NO_CACHE: {
-        *reader = raw_reader;
-        break;
+    if (!opts) {
+        opts = &FileReaderOptions::DEFAULT;
     }
-    case io::FileCachePolicy::SUB_FILE_CACHE:
-    case io::FileCachePolicy::WHOLE_FILE_CACHE: {
-        std::string cache_path = reader_options.path_policy.get_cache_path(path.native());
-        io::FileCachePtr cache_reader = FileCacheManager::instance()->new_file_cache(
-                cache_path, config::file_cache_alive_time_sec, raw_reader,
-                reader_options.cache_type);
-        FileCacheManager::instance()->add_file_cache(cache_path, cache_reader);
-        *reader = cache_reader;
-        break;
-    }
-    case io::FileCachePolicy::FILE_BLOCK_CACHE: {
-        DCHECK(io_ctx);
-        StringPiece str(raw_reader->path().native());
-        std::string cache_path = reader_options.path_policy.get_cache_path(path.native());
-        *reader =
-                std::make_shared<CachedRemoteFileReader>(std::move(raw_reader), cache_path, io_ctx);
-        break;
-    }
-    default: {
-        return Status::InternalError("Unknown cache type: {}", reader_options.cache_type);
-    }
-    }
+    RETURN_IF_ERROR(open_file_internal(path, &raw_reader, *opts));
+    *reader = DORIS_TRY(create_cached_file_reader(raw_reader, *opts));
     return Status::OK();
 }
 
-} // namespace io
-} // namespace doris
+} // namespace doris::io

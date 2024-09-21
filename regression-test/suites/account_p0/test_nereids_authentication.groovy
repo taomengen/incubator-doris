@@ -28,6 +28,7 @@ suite("test_nereids_authentication", "query") {
     }
 
     sql "set enable_nereids_planner = true"
+    sql "set enable_fallback_to_original_planner = false"
 
     def dbName = "nereids_authentication"
     sql "DROP DATABASE IF EXISTS ${dbName}"
@@ -43,7 +44,14 @@ suite("test_nereids_authentication", "query") {
     try_sql "DROP USER ${user}"
     sql "CREATE USER ${user} IDENTIFIED BY 'Doris_123456'"
     sql "GRANT SELECT_PRIV ON internal.${dbName}.${tableName1} TO ${user}"
-
+    //cloud-mode
+    if (isCloudMode()) {
+        def clusters = sql " SHOW CLUSTERS; "
+        assertTrue(!clusters.isEmpty())
+        def validCluster = clusters[0][0]
+        sql """GRANT USAGE_PRIV ON CLUSTER ${validCluster} TO ${user}""";
+    }
+    
     def tokens = context.config.jdbcUrl.split('/')
     def url=tokens[0] + "//" + tokens[2] + "/" + dbName + "?"
     def result = connect(user=user, password='Doris_123456', url=url) {
@@ -52,22 +60,23 @@ suite("test_nereids_authentication", "query") {
     assertEquals(result.size(), 0)
 
     connect(user=user, password='Doris_123456', url=url) {
-        try {
+        test {
             sql "SELECT * FROM ${tableName2}"
-            fail()
-        } catch (Exception e) {
-            log.info(e.getMessage())
-            assertTrue(e.getMessage().contains('SELECT command denied to user'))
+            exception "denied"
         }
     }
 
     connect(user=user, password='Doris_123456', url=url) {
-        try {
+        test {
+            sql "SELECT count(*) FROM ${tableName2}"
+            exception "denied"
+        }
+    }
+
+    connect(user=user, password='Doris_123456', url=url) {
+        test {
             sql "SELECT * FROM ${tableName1}, ${tableName2} WHERE ${tableName1}.`key` = ${tableName2}.`key`"
-            fail()
-        } catch (Exception e) {
-            log.info(e.getMessage())
-            assertTrue(e.getMessage().contains('SELECT command denied to user'))
+            exception "denied"
         }
     }
 
@@ -76,6 +85,9 @@ suite("test_nereids_authentication", "query") {
         sql "SELECT * FROM ${tableName2}"
     }
     assertEquals(result.size(), 0)
+    connect(user=user, password='Doris_123456', url=url) {
+        sql "SELECT count(*) FROM ${tableName2}"
+    }
     connect(user=user, password='Doris_123456', url=url) {
         sql "SELECT * FROM ${tableName1}, ${tableName2} WHERE ${tableName1}.`key` = ${tableName2}.`key`"
     }

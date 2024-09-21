@@ -19,7 +19,6 @@ package org.apache.doris.qe;
 
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.Config;
-import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.Reference;
 import org.apache.doris.common.UserException;
@@ -53,7 +52,7 @@ public class SimpleScheduler {
     private static Map<Long, Pair<Integer, String>> blacklistBackends = Maps.newConcurrentMap();
     private static UpdateBlacklistThread updateBlacklistThread;
 
-    static {
+    public static void init() {
         updateBlacklistThread = new UpdateBlacklistThread();
         updateBlacklistThread.start();
     }
@@ -66,12 +65,14 @@ public class SimpleScheduler {
         if (CollectionUtils.isEmpty(locations) || backends == null || backends.isEmpty()) {
             throw new UserException(SystemInfoService.NO_SCAN_NODE_BACKEND_AVAILABLE_MSG);
         }
-        LOG.debug("getHost backendID={}, backendSize={}", backendId, backends.size());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("getHost backendID={}, backendSize={}", backendId, backends.size());
+        }
         Backend backend = backends.get(backendId);
 
         if (isAvailable(backend)) {
             backendIdRef.setRef(backendId);
-            return new TNetworkAddress(backend.getIp(), backend.getBePort());
+            return new TNetworkAddress(backend.getHost(), backend.getBePort());
         } else {
             for (TScanRangeLocation location : locations) {
                 if (location.backend_id == backendId) {
@@ -81,7 +82,7 @@ public class SimpleScheduler {
                 Backend candidateBackend = backends.get(location.backend_id);
                 if (isAvailable(candidateBackend)) {
                     backendIdRef.setRef(location.backend_id);
-                    return new TNetworkAddress(candidateBackend.getIp(), candidateBackend.getBePort());
+                    return new TNetworkAddress(candidateBackend.getHost(), candidateBackend.getBePort());
                 }
             }
         }
@@ -140,7 +141,7 @@ public class SimpleScheduler {
         if (backendEntry != null) {
             Backend backend = backendEntry.getValue();
             backendIdRef.setRef(backendEntry.getKey());
-            return new TNetworkAddress(backend.getIp(), backend.getBePort());
+            return new TNetworkAddress(backend.getHost(), backend.getBePort());
         }
         // no backend returned
         throw new UserException(SystemInfoService.NO_SCAN_NODE_BACKEND_AVAILABLE_MSG
@@ -170,13 +171,13 @@ public class SimpleScheduler {
     }
 
     public static void addToBlacklist(Long backendID, String reason) {
-        if (backendID == null || Config.disable_backend_black_list) {
-            LOG.warn("ignore backend black list for backend: {}, disabled: {}", backendID,
-                    Config.disable_backend_black_list);
+        if (backendID == null || Config.disable_backend_black_list || Config.isCloudMode()) {
+            LOG.warn("ignore backend black list for backend: {}, disabled: {}, is cloud: {}",
+                    backendID, Config.disable_backend_black_list, Config.isCloudMode());
             return;
         }
 
-        blacklistBackends.put(backendID, Pair.of(FeConstants.heartbeat_interval_second + 1, reason));
+        blacklistBackends.put(backendID, Pair.of(Config.blacklist_duration_second + 1, reason));
         LOG.warn("add backend {} to black list. reason: {}", backendID, reason);
     }
 
@@ -199,12 +200,13 @@ public class SimpleScheduler {
 
         @Override
         public void run() {
-            LOG.debug("UpdateBlacklistThread is start to run");
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("UpdateBlacklistThread is start to run");
+            }
             while (true) {
                 try {
                     Thread.sleep(1000L);
                     SystemInfoService clusterInfoService = Env.getCurrentSystemInfo();
-                    LOG.debug("UpdateBlacklistThread retry begin");
 
                     Iterator<Map.Entry<Long, Pair<Integer, String>>> iterator = blacklistBackends.entrySet().iterator();
                     while (iterator.hasNext()) {
@@ -222,14 +224,13 @@ public class SimpleScheduler {
                                 iterator.remove();
                                 LOG.warn("remove backend {} from black list. reach max try time", backendId);
                             } else {
-                                LOG.debug("blacklistBackends backendID={} retryTimes={}",
-                                        backendId, entry.getValue().first);
+                                if (LOG.isDebugEnabled()) {
+                                    LOG.debug("blacklistBackends backendID={} retryTimes={}",
+                                            backendId, entry.getValue().first);
+                                }
                             }
                         }
                     }
-
-                    LOG.debug("UpdateBlacklistThread retry end");
-
                 } catch (Throwable ex) {
                     LOG.warn("blacklist thread exception", ex);
                 }

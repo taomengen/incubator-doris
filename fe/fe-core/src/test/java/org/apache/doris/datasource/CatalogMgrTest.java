@@ -17,10 +17,10 @@
 
 package org.apache.doris.datasource;
 
+import org.apache.doris.analysis.AlterCatalogCommentStmt;
 import org.apache.doris.analysis.AlterCatalogNameStmt;
 import org.apache.doris.analysis.AlterCatalogPropertyStmt;
 import org.apache.doris.analysis.CreateCatalogStmt;
-import org.apache.doris.analysis.CreateResourceStmt;
 import org.apache.doris.analysis.CreateRoleStmt;
 import org.apache.doris.analysis.CreateUserStmt;
 import org.apache.doris.analysis.DropCatalogStmt;
@@ -38,15 +38,19 @@ import org.apache.doris.catalog.PartitionKey;
 import org.apache.doris.catalog.PrimitiveType;
 import org.apache.doris.catalog.ResourceMgr;
 import org.apache.doris.catalog.Type;
-import org.apache.doris.catalog.external.EsExternalDatabase;
-import org.apache.doris.catalog.external.EsExternalTable;
-import org.apache.doris.catalog.external.HMSExternalDatabase;
-import org.apache.doris.catalog.external.HMSExternalTable;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ExceptionChecker;
 import org.apache.doris.common.FeConstants;
+import org.apache.doris.datasource.es.EsExternalCatalog;
+import org.apache.doris.datasource.es.EsExternalDatabase;
+import org.apache.doris.datasource.es.EsExternalTable;
+import org.apache.doris.datasource.hive.HMSExternalCatalog;
+import org.apache.doris.datasource.hive.HMSExternalDatabase;
+import org.apache.doris.datasource.hive.HMSExternalTable;
 import org.apache.doris.datasource.hive.HiveMetaStoreCache;
+import org.apache.doris.datasource.hive.HiveMetaStoreCache.FileCacheKey;
+import org.apache.doris.datasource.hive.HiveMetaStoreCache.FileCacheValue;
 import org.apache.doris.datasource.hive.HiveMetaStoreCache.HivePartitionValues;
 import org.apache.doris.datasource.hive.HiveMetaStoreCache.PartitionValueCacheKey;
 import org.apache.doris.mysql.privilege.Auth;
@@ -55,10 +59,12 @@ import org.apache.doris.planner.ListPartitionPrunerV2;
 import org.apache.doris.planner.PartitionPrunerV2Base.UniqueId;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.ShowResultSet;
-import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.utframe.TestWithFeService;
 
+import com.github.benmanes.caffeine.cache.LoadingCache;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.BiMap;
+import com.google.common.collect.HashBiMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Range;
@@ -99,28 +105,17 @@ public class CatalogMgrTest extends TestWithFeService {
         // grant with no catalog is switched, internal catalog works.
         CreateRoleStmt createRole1 = (CreateRoleStmt) parseAndAnalyzeStmt("create role role1;", rootCtx);
         auth.createRole(createRole1);
-        GrantStmt grantRole1 = (GrantStmt) parseAndAnalyzeStmt("grant grant_priv on tpch.* to role 'role1';", rootCtx);
-        auth.grant(grantRole1);
-        // grant with ctl.db.tbl. grant can succeed even if the catalog does not exist
-        GrantStmt grantRole1WithCtl = (GrantStmt) parseAndAnalyzeStmt(
-                "grant select_priv on testc.testdb.* to role 'role1';", rootCtx);
-        auth.grant(grantRole1WithCtl);
-        // user1 can't switch to hive
         auth.createUser((CreateUserStmt) parseAndAnalyzeStmt(
                 "create user 'user1'@'%' identified by 'pwd1' default role 'role1';", rootCtx));
         user1 = new UserIdentity("user1", "%");
-        user1.analyze(SystemInfoService.DEFAULT_CLUSTER);
+        user1.analyze();
         // user1 has the privileges of testc which is granted by ctl.db.tbl format.
         // TODO: 2023/1/20 zdtodo
         //        Assert.assertTrue(auth.getDbPrivTable().hasPrivsOfCatalog(user1, "testc"));
 
-        // create hms catalog by resource
-        CreateResourceStmt hmsResource = (CreateResourceStmt) parseAndAnalyzeStmt(
-                "create resource hms_resource properties('type' = 'hms', 'hive.metastore.uris' = 'thrift://192.168.0.1:9083');",
-                rootCtx);
-        env.getResourceMgr().createResource(hmsResource);
+        // create hms catalog
         CreateCatalogStmt hiveCatalog = (CreateCatalogStmt) parseAndAnalyzeStmt(
-                "create catalog hive with resource hms_resource;",
+                "create catalog hive properties('type' = 'hms', 'hive.metastore.uris' = 'thrift://192.168.0.1:9083');",
                 rootCtx);
         env.getCatalogMgr().createCatalog(hiveCatalog);
         // deprecated: create hms catalog by properties
@@ -134,14 +129,9 @@ public class CatalogMgrTest extends TestWithFeService {
                 rootCtx);
         env.getCatalogMgr().createCatalog(iceBergCatalog);
 
-        // create es catalog by resource
-        CreateResourceStmt esResource = (CreateResourceStmt) parseAndAnalyzeStmt(
-                "create resource es_resource properties('type' = 'es', 'hosts' = 'http://192.168.0.1', 'user' = 'user1');",
-                rootCtx);
-
-        env.getResourceMgr().createResource(esResource);
+        // create es catalog
         CreateCatalogStmt esCatalog = (CreateCatalogStmt) parseAndAnalyzeStmt(
-                "create catalog es with resource es_resource;",
+                "create catalog es properties('type' = 'es', 'hosts' = 'http://192.168.0.1', 'user' = 'user1');",
                 rootCtx);
         env.getCatalogMgr().createCatalog(esCatalog);
         // deprecated: create es catalog by properties
@@ -165,7 +155,7 @@ public class CatalogMgrTest extends TestWithFeService {
         auth.createUser((CreateUserStmt) parseAndAnalyzeStmt(
                 "create user 'user2'@'%' identified by 'pwd2' default role 'role2';", rootCtx));
         user2 = new UserIdentity("user2", "%");
-        user2.analyze(SystemInfoService.DEFAULT_CLUSTER);
+        user2.analyze();
     }
 
     private void createDbAndTableForCatalog(CatalogIf catalog) {
@@ -191,6 +181,7 @@ public class CatalogMgrTest extends TestWithFeService {
     @Test
     public void testNormalCase() throws Exception {
         String createCatalogSql = "CREATE CATALOG hms_catalog "
+                + "comment 'hms comment'"
                 + "properties( \"type\" = \"hms\", \"hive.metastore.uris\"=\"thrift://localhost:9083\" )";
         CreateCatalogStmt createStmt = (CreateCatalogStmt) parseAndAnalyzeStmt(createCatalogSql);
         mgr.createCatalog(createStmt);
@@ -238,24 +229,29 @@ public class CatalogMgrTest extends TestWithFeService {
         mgr.alterCatalogProps(alterPropStmt);
 
         CatalogIf catalog = env.getCatalogMgr().getCatalog(MY_CATALOG);
-        Assert.assertEquals(2, catalog.getProperties().size());
+        // type, hive.metastore.uris and create_time
+        Assert.assertEquals(5, catalog.getProperties().size());
         Assert.assertEquals("thrift://172.16.5.9:9083", catalog.getProperties().get("hive.metastore.uris"));
 
         // test add property
         Map<String, String> alterProps2 = Maps.newHashMap();
         alterProps2.put("dfs.nameservices", "service1");
         alterProps2.put("dfs.ha.namenodes.service1", "nn1,nn2");
+        alterProps2.put("dfs.namenode.rpc-address.service1.nn1", "nn1_host:rpc_port");
+        alterProps2.put("dfs.namenode.rpc-address.service1.nn2", "nn2_host:rpc_port");
+        alterProps2.put("dfs.client.failover.proxy.provider.service1",
+                "org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider");
         AlterCatalogPropertyStmt alterStmt = new AlterCatalogPropertyStmt(MY_CATALOG, alterProps2);
         mgr.alterCatalogProps(alterStmt);
         catalog = env.getCatalogMgr().getCatalog(MY_CATALOG);
-        Assert.assertEquals(4, catalog.getProperties().size());
+        Assert.assertEquals(10, catalog.getProperties().size());
         Assert.assertEquals("service1", catalog.getProperties().get("dfs.nameservices"));
 
         String showDetailCatalog = "SHOW CATALOG my_catalog";
         ShowCatalogStmt showDetailStmt = (ShowCatalogStmt) parseAndAnalyzeStmt(showDetailCatalog);
         showResultSet = mgr.showCatalogs(showDetailStmt);
 
-        Assert.assertEquals(4, showResultSet.getResultRows().size());
+        Assert.assertEquals(10, showResultSet.getResultRows().size());
         for (List<String> row : showResultSet.getResultRows()) {
             Assertions.assertEquals(2, row.size());
             if (row.get(0).equalsIgnoreCase("type")) {
@@ -272,7 +268,9 @@ public class CatalogMgrTest extends TestWithFeService {
         Assert.assertEquals(1, showResultSet.getResultRows().size());
         List<String> result = showResultSet.getResultRows().get(0);
         Assertions.assertEquals("my_catalog", result.get(0));
-        Assertions.assertTrue(result.get(1).startsWith("CREATE CATALOG `my_catalog` PROPERTIES ("));
+        Assertions.assertTrue(result.get(1).startsWith("\nCREATE CATALOG `my_catalog`\nCOMMENT \"hms comment\"\n PROPERTIES ("));
+        Assertions.assertTrue(!result.get(1).contains(ExternalCatalog.CREATE_TIME));
+        Assertions.assertTrue(!result.get(1).contains(ExternalCatalog.USE_META_CACHE));
 
         testCatalogMgrPersist();
 
@@ -284,6 +282,9 @@ public class CatalogMgrTest extends TestWithFeService {
         showStmt = (ShowCatalogStmt) parseAndAnalyzeStmt(showCatalogSql);
         showResultSet = mgr.showCatalogs(showStmt);
         Assertions.assertEquals(6, showResultSet.getResultRows().size());
+
+        //test alter fileCache
+        testAlterFileCache();
     }
 
     private void testCatalogMgrPersist() throws Exception {
@@ -321,7 +322,7 @@ public class CatalogMgrTest extends TestWithFeService {
 
         CatalogIf hms = mgr2.getCatalog(MY_CATALOG);
         properties = hms.getProperties();
-        Assert.assertEquals(4, properties.size());
+        Assert.assertEquals(10, properties.size());
         Assert.assertEquals("hms", properties.get("type"));
         Assert.assertEquals("thrift://172.16.5.9:9083", properties.get("hive.metastore.uris"));
 
@@ -343,7 +344,7 @@ public class CatalogMgrTest extends TestWithFeService {
             Assert.fail("user1 switch to hive with no privilege.");
         } catch (AnalysisException e) {
             Assert.assertEquals(e.getMessage(),
-                    "errCode = 2, detailMessage = Access denied for user 'default_cluster:user1' to catalog 'hive'");
+                    "errCode = 2, detailMessage = Access denied for user 'user1' to catalog 'hive'");
         }
         Assert.assertEquals(InternalCatalog.INTERNAL_CATALOG_NAME, user1Ctx.getDefaultCatalog());
 
@@ -356,21 +357,18 @@ public class CatalogMgrTest extends TestWithFeService {
         String showCatalogSql = "SHOW CATALOGS";
         ShowCatalogStmt showStmt = (ShowCatalogStmt) parseAndAnalyzeStmt(showCatalogSql);
         ShowResultSet showResultSet = mgr.showCatalogs(showStmt, user2Ctx.getCurrentCatalog().getName());
-        Assertions.assertEquals("yes", showResultSet.getResultRows().get(1).get(3));
+        Assertions.assertEquals("Yes", showResultSet.getResultRows().get(1).get(3));
+        Assertions.assertEquals("No", showResultSet.getResultRows().get(0).get(3));
 
         // user2 can switch to hive
         SwitchStmt switchHive = (SwitchStmt) parseAndAnalyzeStmt("switch hive;", user2Ctx);
         env.changeCatalog(user2Ctx, switchHive.getCatalogName());
         Assert.assertEquals(user2Ctx.getDefaultCatalog(), "hive");
-        // user2 can grant select_priv to tpch.customer
-        GrantStmt user2GrantHiveTable = (GrantStmt) parseAndAnalyzeStmt(
-                "grant select_priv on tpch.customer to 'user2'@'%';", user2Ctx);
-        auth.grant(user2GrantHiveTable);
 
         showCatalogSql = "SHOW CATALOGS";
         showStmt = (ShowCatalogStmt) parseAndAnalyzeStmt(showCatalogSql);
         showResultSet = mgr.showCatalogs(showStmt, user2Ctx.getCurrentCatalog().getName());
-        Assertions.assertEquals("yes", showResultSet.getResultRows().get(0).get(3));
+        Assertions.assertEquals("Yes", showResultSet.getResultRows().get(0).get(3));
     }
 
     @Test
@@ -413,7 +411,7 @@ public class CatalogMgrTest extends TestWithFeService {
             Assert.fail("");
         } catch (AnalysisException e) {
             Assert.assertEquals(e.getMessage(),
-                    "errCode = 2, detailMessage = Access denied for user 'default_cluster:user2' to catalog 'iceberg'");
+                    "errCode = 2, detailMessage = Access denied for user 'user2' to catalog 'iceberg'");
         }
 
         //test show create catalog: have permission to hive, have no permission to iceberg;
@@ -430,7 +428,7 @@ public class CatalogMgrTest extends TestWithFeService {
             Assert.fail("");
         } catch (AnalysisException e) {
             Assert.assertEquals(e.getMessage(),
-                    "errCode = 2, detailMessage = Access denied for user 'default_cluster:user2' to catalog 'iceberg'");
+                    "errCode = 2, detailMessage = Access denied for user 'user2' to catalog 'iceberg'");
         }
     }
 
@@ -459,7 +457,7 @@ public class CatalogMgrTest extends TestWithFeService {
                 Lists.newArrayList("y=2020/m=1", "y=2020/m=2"), metaStoreCache);
         metaStoreCache.putPartitionValuesCacheForTest(partitionValueCacheKey, hivePartitionValues);
         metaStoreCache.dropPartitionsCache("hiveDb", "hiveTable", Lists.newArrayList("y=2020/m=1", "y=2020/m=2"),
-                partitionValueCacheKey.getTypes(), false);
+                false);
         HivePartitionValues partitionValues = metaStoreCache.getPartitionValues(partitionValueCacheKey);
         Assert.assertEquals(partitionValues.getPartitionNameToIdMap().size(), 0);
     }
@@ -477,6 +475,7 @@ public class CatalogMgrTest extends TestWithFeService {
                 partitionValueCacheKey.getTypes());
         HivePartitionValues partitionValues = metaStoreCache.getPartitionValues(partitionValueCacheKey);
         Assert.assertEquals(partitionValues.getPartitionNameToIdMap().size(), 4);
+        Assert.assertEquals(partitionValues.getPartitionNameToIdMap().inverse().size(), 4);
     }
 
     @Test
@@ -489,7 +488,7 @@ public class CatalogMgrTest extends TestWithFeService {
                 Lists.newArrayList("m=1", "m=2"), metaStoreCache);
         metaStoreCache.putPartitionValuesCacheForTest(partitionValueCacheKey, hivePartitionValues);
         metaStoreCache.dropPartitionsCache("hiveDb", "hiveTable", Lists.newArrayList("m=1", "m=2"),
-                partitionValueCacheKey.getTypes(), false);
+                false);
         HivePartitionValues partitionValues = metaStoreCache.getPartitionValues(partitionValueCacheKey);
         Assert.assertEquals(partitionValues.getPartitionNameToIdMap().size(), 0);
     }
@@ -520,7 +519,7 @@ public class CatalogMgrTest extends TestWithFeService {
             HiveMetaStoreCache metaStoreCache) {
         // partition name format: nation=cn/city=beijing
         Map<Long, PartitionItem> idToPartitionItem = Maps.newHashMapWithExpectedSize(partitionNames.size());
-        Map<String, Long> partitionNameToIdMap = Maps.newHashMapWithExpectedSize(partitionNames.size());
+        BiMap<String, Long> partitionNameToIdMap = HashBiMap.create(partitionNames.size());
         Map<Long, List<UniqueId>> idToUniqueIdsMap = Maps.newHashMapWithExpectedSize(partitionNames.size());
         long idx = 0;
         for (String partitionName : partitionNames) {
@@ -545,7 +544,7 @@ public class CatalogMgrTest extends TestWithFeService {
             singleUidToColumnRangeMap = ListPartitionPrunerV2.genSingleUidToColumnRange(singleColumnRangeMap);
         }
         Map<Long, List<String>> partitionValuesMap = ListPartitionPrunerV2.getPartitionValuesMap(idToPartitionItem);
-        return new HivePartitionValues(idToPartitionItem, uidToPartitionRange, rangeToId, singleColumnRangeMap, idx,
+        return new HivePartitionValues(idToPartitionItem, uidToPartitionRange, rangeToId, singleColumnRangeMap,
                 partitionNameToIdMap, idToUniqueIdsMap, singleUidToColumnRangeMap, partitionValuesMap);
     }
 
@@ -605,5 +604,187 @@ public class CatalogMgrTest extends TestWithFeService {
         ExceptionChecker.expectThrowsWithMsg(DdlException.class,
                 "Required property 'driver_url' is missing",
                 () -> mgr.createCatalog(createStmt4));
+
+        createCatalogSql = "CREATE CATALOG bad_hive_3 PROPERTIES (\n"
+                + "    'type'='hms',\n"
+                + "    'hive.metastore.uris' = 'thrift://172.21.0.1:7004',\n"
+                + "    'hadoop.username' = 'hive',\n"
+                + "    'dfs.nameservices'='your-nameservice',\n"
+                + "    'dfs.ha.namenodes.your-nameservice'='nn1,nn2',\n"
+                + "    'dfs.namenode.rpc-address.your-nameservice.nn1'='172.21.0.2:4007',\n"
+                + "    'dfs.namenode.rpc-address.your-nameservice.nn2'='172.21.0.3:4007',\n"
+                + "    'file.meta.cache.ttl-second'='2m'\n"
+                + ");";
+        CreateCatalogStmt createStmt5 = (CreateCatalogStmt) parseAndAnalyzeStmt(createCatalogSql);
+        ExceptionChecker.expectThrowsWithMsg(DdlException.class,
+                "The parameter file.meta.cache.ttl-second is wrong, value is 2m",
+                () -> mgr.createCatalog(createStmt5));
+
+        createCatalogSql = "CREATE CATALOG bad_hive_4 PROPERTIES (\n"
+                + "    'type'='hms',\n"
+                + "    'hive.metastore.uris' = 'thrift://172.21.0.1:7004',\n"
+                + "    'hadoop.username' = 'hive',\n"
+                + "    'dfs.nameservices'='your-nameservice',\n"
+                + "    'dfs.ha.namenodes.your-nameservice'='nn1,nn2',\n"
+                + "    'dfs.namenode.rpc-address.your-nameservice.nn1'='172.21.0.2:4007',\n"
+                + "    'dfs.namenode.rpc-address.your-nameservice.nn2'='172.21.0.3:4007',\n"
+                + "    'file.meta.cache.ttl-second'=''\n"
+                + ");";
+        CreateCatalogStmt createStmt6 = (CreateCatalogStmt) parseAndAnalyzeStmt(createCatalogSql);
+        ExceptionChecker.expectThrowsWithMsg(DdlException.class,
+                "The parameter file.meta.cache.ttl-second is wrong, value is ",
+                () -> mgr.createCatalog(createStmt6));
+
+        createCatalogSql = "CREATE CATALOG good_hive_2 PROPERTIES (\n"
+                + "    'type'='hms',\n"
+                + "    'hive.metastore.uris' = 'thrift://172.21.0.1:7004',\n"
+                + "    'hadoop.username' = 'hive',\n"
+                + "    'dfs.nameservices'='your-nameservice',\n"
+                + "    'dfs.ha.namenodes.your-nameservice'='nn1,nn2',\n"
+                + "    'dfs.namenode.rpc-address.your-nameservice.nn1'='172.21.0.2:4007',\n"
+                + "    'dfs.namenode.rpc-address.your-nameservice.nn2'='172.21.0.3:4007',\n"
+                + "    'file.meta.cache.ttl-second'='60',\n"
+                + "    'dfs.client.failover.proxy.provider.your-nameservice'"
+                + "='org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider'\n"
+                + ");";
+        CreateCatalogStmt createStmt7 = (CreateCatalogStmt) parseAndAnalyzeStmt(createCatalogSql);
+        ExceptionChecker.expectThrowsNoException(() -> mgr.createCatalog(createStmt7));
+    }
+
+    @Test
+    public void testInvalidAndValidAlterCatalogProperties() throws Exception {
+
+        String catalogName = "test_hive1";
+        String createCatalogSql = "CREATE CATALOG test_hive1 PROPERTIES (\n"
+                + "    'type'='hms',\n"
+                + "    'hive.metastore.uris' = 'thrift://127.0.0.1:7007',\n"
+                + "    'dfs.nameservices' = 'HANN',\n"
+                + "    'dfs.ha.namenodes.HANN'='nn1,nn2',\n"
+                + "    'dfs.namenode.rpc-address.HANN.nn1'='127.0.0.1:4007',\n"
+                + "    'dfs.namenode.rpc-address.HANN.nn2'='127.0.0.1:4008',\n"
+                + "    'dfs.client.failover.proxy.provider.HANN'"
+                + "='org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider'\n"
+                + ");";
+        CreateCatalogStmt createStmt = (CreateCatalogStmt) parseAndAnalyzeStmt(createCatalogSql);
+        mgr.createCatalog(createStmt);
+
+        String alterCatalogSql = "ALTER CATALOG test_hive1 SET PROPERTIES (\n"
+                + "    'type'='hms',\n"
+                + "    'hive.metastore.uris' = 'thrift://127.0.0.1:7007',\n"
+                + "    'dfs.nameservices' = 'HANN',\n"
+                + "    'dfs.ha.namenodes.HANN'='',\n"
+                + "    'dfs.client.failover.proxy.provider.HANN'"
+                + "='org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider'\n"
+                + ");";
+        AlterCatalogPropertyStmt alterCatalogPropertyStmt1 = (AlterCatalogPropertyStmt) parseAndAnalyzeStmt(
+                alterCatalogSql);
+        ExceptionChecker.expectThrowsWithMsg(DdlException.class,
+                "Missing dfs.ha.namenodes.HANN property",
+                () -> mgr.alterCatalogProps(alterCatalogPropertyStmt1));
+
+        alterCatalogSql = "ALTER CATALOG test_hive1 SET PROPERTIES (\n"
+                + "    'type'='hms',\n"
+                + "    'hive.metastore.uris' = 'thrift://127.0.0.1:7007',\n"
+                + "    'dfs.nameservices' = 'HANN',\n"
+                + "    'dfs.ha.namenodes.HANN'='nn1,nn3',\n"
+                + "    'dfs.namenode.rpc-address.HANN.nn1'='127.0.0.1:4007',\n"
+                + "    'dfs.namenode.rpc-address.HANN.nn3'='127.0.0.1:4007',\n"
+                + "    'dfs.client.failover.proxy.provider.HANN'"
+                + "=''\n"
+                + ");";
+        AlterCatalogPropertyStmt alterCatalogPropertyStmt2 = (AlterCatalogPropertyStmt) parseAndAnalyzeStmt(
+                alterCatalogSql);
+        ExceptionChecker.expectThrowsWithMsg(DdlException.class,
+                "Missing dfs.client.failover.proxy.provider.HANN property",
+                () -> mgr.alterCatalogProps(alterCatalogPropertyStmt2));
+
+        alterCatalogSql = "ALTER CATALOG test_hive1 SET PROPERTIES (\n"
+                + "    'type'='hms',\n"
+                + "    'hive.metastore.uris' = 'thrift://127.0.0.1:7007',\n"
+                + "    'dfs.nameservices' = 'HANN',\n"
+                + "    'dfs.ha.namenodes.HANN'='nn1,nn3',\n"
+                + "    'dfs.namenode.rpc-address.HANN.nn1'='127.0.0.1:4007',\n"
+                + "    'dfs.namenode.rpc-address.HANN.nn3'='127.0.0.1:4007',\n"
+                + "    'dfs.client.failover.proxy.provider.HANN'"
+                + "='org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider'\n"
+                + ");";
+        AlterCatalogPropertyStmt alterCatalogPropertyStmt3 = (AlterCatalogPropertyStmt) parseAndAnalyzeStmt(
+                alterCatalogSql);
+        mgr.alterCatalogProps(alterCatalogPropertyStmt3);
+
+        CatalogIf catalog = env.getCatalogMgr().getCatalog(catalogName);
+        Assert.assertEquals(11, catalog.getProperties().size());
+        Assert.assertEquals("nn1,nn3", catalog.getProperties().get("dfs.ha.namenodes.HANN"));
+    }
+
+    public void testAlterFileCache() throws Exception {
+        String catalogName = "good_hive_3";
+        String createCatalogSql = "CREATE CATALOG " + catalogName
+                + " COMMENT 'create comment'\n"
+                + " PROPERTIES (\n"
+                + "    'type'='hms',\n"
+                + "    'hive.metastore.uris' = 'thrift://172.21.0.1:7004',\n"
+                + "    'hadoop.username' = 'hive',\n"
+                + "    'dfs.nameservices'='your-nameservice',\n"
+                + "    'dfs.ha.namenodes.your-nameservice'='nn1,nn2',\n"
+                + "    'dfs.namenode.rpc-address.your-nameservice.nn1'='172.21.0.2:4007',\n"
+                + "    'dfs.namenode.rpc-address.your-nameservice.nn2'='172.21.0.3:4007',\n"
+                + "    'file.meta.cache.ttl-second'='60',\n"
+                + "    'dfs.client.failover.proxy.provider.your-nameservice'"
+                + "='org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider'\n"
+                + ");";
+        CreateCatalogStmt createStmt8 = (CreateCatalogStmt) parseAndAnalyzeStmt(createCatalogSql);
+        ExceptionChecker.expectThrowsNoException(() -> mgr.createCatalog(createStmt8));
+
+        HMSExternalCatalog hiveCatalog = (HMSExternalCatalog) mgr.getCatalog(catalogName);
+        HiveMetaStoreCache metaStoreCache = externalMetaCacheMgr.getMetaStoreCache(hiveCatalog);
+        LoadingCache<FileCacheKey, FileCacheValue> preFileCache = metaStoreCache.getFileCacheRef().get();
+
+
+        // 1. properties contains `file.meta.cache.ttl-second`, it should not be equal
+        String alterCatalogProp = "ALTER CATALOG " + catalogName + " SET PROPERTIES"
+                + " ('file.meta.cache.ttl-second'='120');";
+        mgr.alterCatalogProps((AlterCatalogPropertyStmt) parseAndAnalyzeStmt(alterCatalogProp));
+        Assertions.assertEquals("120", mgr.getCatalog(catalogName).getProperties().get("file.meta.cache.ttl-second"));
+
+        Assertions.assertNotEquals(preFileCache, metaStoreCache.getFileCacheRef().get());
+        preFileCache = metaStoreCache.getFileCacheRef().get();
+
+        // 2. properties not contains `file.meta.cache.ttl-second`, it should be equal
+        alterCatalogProp = "ALTER CATALOG " + catalogName + " SET PROPERTIES"
+                + " (\"type\" = \"hms\", \"hive.metastore.uris\" = \"thrift://172.16.5.9:9083\");";
+        mgr.alterCatalogProps((AlterCatalogPropertyStmt) parseAndAnalyzeStmt(alterCatalogProp));
+        Assertions.assertEquals(preFileCache, metaStoreCache.getFileCacheRef().get());
+    }
+
+    @Test
+    public void testCatalogWithComment() throws Exception {
+        ConnectContext rootCtx = createDefaultCtx();
+        CreateCatalogStmt catalogWithComment = (CreateCatalogStmt) parseAndAnalyzeStmt(
+                "create catalog hive_c comment 'create' properties('type' = 'hms', 'hive.metastore.uris' = 'thrift://192.168.0.1:9083');",
+                rootCtx);
+        env.getCatalogMgr().createCatalog(catalogWithComment);
+        Assertions.assertNotNull(env.getCatalogMgr().getCatalog("hive_c").getComment());
+
+        String alterComment = "ALTER CATALOG hive_c SET PROPERTIES"
+                + " (\"comment\" = \"alter comment\");";
+        mgr.alterCatalogProps((AlterCatalogPropertyStmt) parseAndAnalyzeStmt(alterComment));
+        // we do not set `comment` auto by `comment in properties`
+        Assertions.assertEquals("create", env.getCatalogMgr().getCatalog("hive_c").getComment());
+    }
+
+    @Test
+    public void testAlterCatalogComment() throws Exception {
+        ConnectContext rootCtx = createDefaultCtx();
+        CreateCatalogStmt catalogWithComment = (CreateCatalogStmt) parseAndAnalyzeStmt(
+                "create catalog hive_c1 comment 'create' properties('type' = 'hms', 'hive.metastore.uris' = 'thrift://192.168.0.1:9083');",
+                rootCtx);
+        env.getCatalogMgr().createCatalog(catalogWithComment);
+        Assertions.assertEquals("create", env.getCatalogMgr().getCatalog("hive_c1").getComment());
+
+        String alterComment = "ALTER CATALOG hive_c1 MODIFY COMMENT 'new_comment';";
+        mgr.alterCatalogComment((AlterCatalogCommentStmt) parseAndAnalyzeStmt(alterComment));
+        // we do not set `comment` auto by `comment in properties`
+        Assertions.assertEquals("new_comment", env.getCatalogMgr().getCatalog("hive_c1").getComment());
     }
 }

@@ -24,50 +24,54 @@ import org.junit.jupiter.api.Test;
 public class InferTest extends SqlTestBase {
     @Test
     void testInferNotNullAndInferPredicates() {
+        connectContext.getSessionVariable().setDisableNereidsRules("PRUNE_EMPTY_PARTITION");
         // Test InferNotNull, EliminateOuter, InferPredicate together
         String sql = "select * from T1 left outer join T2 on T1.id = T2.id where T2.id = 4";
         PlanChecker.from(connectContext)
                 .analyze(sql)
                 .rewrite()
-                .matchesFromRoot(
+                .matches(
                         innerLogicalJoin(
-                                logicalFilter().when(f -> f.getPredicate().toString().equals("(id#0 = 4)")),
-                                logicalFilter().when(f -> f.getPredicate().toString().equals("(id#2 = 4)"))
+                            logicalFilter().when(f -> f.getPredicate().toString().equals("(id#0 = 4)")),
+                            logicalFilter().when(f -> f.getPredicate().toString().equals("(id#2 = 4)"))
                         )
                 );
     }
 
     @Test
     void testInferNotNullFromFilterAndEliminateOuter2() {
+        connectContext.getSessionVariable().setDisableNereidsRules("PRUNE_EMPTY_PARTITION");
         String sql
                 = "select * from T1 right outer join T2 on T1.id = T2.id where T1.id = 4 OR (T1.id > 4 AND T2.score IS NULL)";
         PlanChecker.from(connectContext)
                 .analyze(sql)
                 .rewrite()
                 .printlnTree()
-                .matchesFromRoot(
-                        innerLogicalJoin(
-                                logicalFilter().when(
-                                        f -> f.getPredicate().toString().equals("((id#0 = 4) OR (id#0 > 4))")),
-                                logicalOlapScan()
-                        )
+                .matches(
+                    innerLogicalJoin(
+                        logicalOlapScan(),
+                        logicalFilter().when(
+                                f -> f.getPredicate().toString().equals("((id#0 = 4) OR (id#0 > 4))"))
+                    )
+
                 );
     }
 
     @Test
     void testInferNotNullFromFilterAndEliminateOuter3() {
+        connectContext.getSessionVariable().setDisableNereidsRules("PRUNE_EMPTY_PARTITION");
         String sql
                 = "select * from T1 full outer join T2 on T1.id = T2.id where T1.id = 4 OR (T1.id > 4 AND T2.score IS NULL)";
         PlanChecker.from(connectContext)
                 .analyze(sql)
                 .rewrite()
-                .matchesFromRoot(
+                .matches(
                         logicalFilter(
-                                leftOuterLogicalJoin(
-                                        logicalFilter().when(
-                                                f -> f.getPredicate().toString().equals("((id#0 = 4) OR (id#0 > 4))")),
-                                        logicalOlapScan()
-                                )
+                            leftOuterLogicalJoin(
+                                logicalFilter().when(
+                                        f -> f.getPredicate().toString().equals("((id#0 = 4) OR (id#0 > 4))")),
+                                logicalOlapScan()
+                            )
                         ).when(f -> f.getPredicate().toString()
                                 .equals("((id#0 = 4) OR ((id#0 > 4) AND score#3 IS NULL))"))
                 );
@@ -75,6 +79,7 @@ public class InferTest extends SqlTestBase {
 
     @Test
     void testInferNotNullFromJoinAndEliminateOuter() {
+        connectContext.getSessionVariable().setDisableNereidsRules("PRUNE_EMPTY_PARTITION");
         // Is Not Null will infer from semi join, so right outer join can be eliminated.
         String sql
                 = "select * from (select T1.id from T1 right outer join T2 on T1.id = T2.id) T1 left semi join T3 on T1.id = T3.id";
@@ -82,11 +87,26 @@ public class InferTest extends SqlTestBase {
                 .analyze(sql)
                 .rewrite()
                 .matches(
-                        leftSemiLogicalJoin(
-                                logicalProject(
-                                        innerLogicalJoin()
-                                ),
-                                logicalProject()
+                        innerLogicalJoin(
+                                logicalProject(),
+                                logicalProject(leftSemiLogicalJoin())
+                        )
+                );
+    }
+
+    @Test
+    void aggEliminateOuterJoin() {
+        connectContext.getSessionVariable().setDisableNereidsRules("PRUNE_EMPTY_PARTITION");
+        String sql = "select count(T2.score) from T1 left Join T2 on T1.id = T2.id";
+
+        PlanChecker.from(connectContext)
+                .analyze(sql)
+                .rewrite()
+                .matches(
+                        logicalAggregate(
+                               logicalProject(
+                                       innerLogicalJoin()
+                               )
                         )
                 );
     }

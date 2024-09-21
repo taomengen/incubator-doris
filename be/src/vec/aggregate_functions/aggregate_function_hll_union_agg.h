@@ -17,21 +17,42 @@
 
 #pragma once
 
-#include <type_traits>
+#include <stddef.h>
+#include <stdint.h>
+
+#include <algorithm>
+#include <boost/iterator/iterator_facade.hpp>
+#include <memory>
+#include <string>
 
 #include "olap/hll.h"
+#include "util/slice.h"
 #include "vec/aggregate_functions/aggregate_function.h"
-#include "vec/columns/column_string.h"
-#include "vec/columns/column_vector.h"
+#include "vec/columns/column_complex.h"
+#include "vec/columns/columns_number.h"
+#include "vec/common/assert_cast.h"
+#include "vec/common/string_ref.h"
+#include "vec/core/types.h"
 #include "vec/data_types/data_type_hll.h"
 #include "vec/data_types/data_type_number.h"
-#include "vec/data_types/data_type_string.h"
 #include "vec/io/io_helper.h"
+
+namespace doris {
+namespace vectorized {
+class Arena;
+class BufferReadable;
+class BufferWritable;
+class IColumn;
+} // namespace vectorized
+} // namespace doris
 
 namespace doris::vectorized {
 
 struct AggregateFunctionHLLData {
     HyperLogLog dst_hll {};
+
+    AggregateFunctionHLLData() = default;
+    ~AggregateFunctionHLLData() = default;
 
     void merge(const AggregateFunctionHLLData& rhs) { dst_hll.merge(rhs.dst_hll); }
 
@@ -55,7 +76,7 @@ struct AggregateFunctionHLLData {
     void reset() { dst_hll.clear(); }
 
     void add(const IColumn* column, size_t row_num) {
-        const auto& sources = static_cast<const ColumnHLL&>(*column);
+        const auto& sources = assert_cast<const ColumnHLL&, TypeCheckOnRelease::DISABLE>(*column);
         dst_hll.merge(sources.get_element(row_num));
     }
 };
@@ -88,8 +109,9 @@ template <typename Data>
 class AggregateFunctionHLLUnion
         : public IAggregateFunctionDataHelper<Data, AggregateFunctionHLLUnion<Data>> {
 public:
-    AggregateFunctionHLLUnion(const DataTypes& argument_types)
-            : IAggregateFunctionDataHelper<Data, AggregateFunctionHLLUnion<Data>>(argument_types) {}
+    AggregateFunctionHLLUnion(const DataTypes& argument_types_)
+            : IAggregateFunctionDataHelper<Data, AggregateFunctionHLLUnion<Data>>(argument_types_) {
+    }
 
     String get_name() const override { return Data::name(); }
 
@@ -99,7 +121,7 @@ public:
         this->data(place).insert_result_into(to);
     }
 
-    void add(AggregateDataPtr __restrict place, const IColumn** columns, size_t row_num,
+    void add(AggregateDataPtr __restrict place, const IColumn** columns, ssize_t row_num,
              Arena* arena) const override {
         this->data(place).add(columns[0], row_num);
     }

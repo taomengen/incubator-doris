@@ -17,7 +17,28 @@
 
 #include "olap/rowset/segment_v2/inverted_index_compound_reader.h"
 
-#include "olap/rowset/segment_v2/inverted_index_compound_directory.h"
+#include <CLucene/clucene-config.h>
+#include <CLucene/debug/error.h>
+#include <CLucene/debug/mem.h>
+#include <CLucene/store/RAMDirectory.h>
+#include <CLucene/util/Misc.h>
+#include <stdio.h>
+#include <string.h>
+#include <wchar.h>
+
+#include <memory>
+#include <utility>
+
+#include "CLucene/SharedHeader.h"
+#include "olap/rowset/segment_v2/inverted_index_fs_directory.h"
+#include "olap/tablet_schema.h"
+#include "util/debug_points.h"
+
+namespace doris {
+namespace io {
+class FileWriter;
+} // namespace io
+} // namespace doris
 
 #define BUFFER_LENGTH 16384
 #define CL_MAX_PATH 4096
@@ -29,19 +50,6 @@ using FileWriterPtr = std::unique_ptr<doris::io::FileWriter>;
 
 namespace doris {
 namespace segment_v2 {
-
-class DorisCompoundReader::ReaderFileEntry : LUCENE_BASE {
-public:
-    std::string file_name {};
-    int64_t offset;
-    int64_t length;
-    ReaderFileEntry() {
-        //file_name = nullptr;
-        offset = 0;
-        length = 0;
-    }
-    ~ReaderFileEntry() override = default;
-};
 
 /** Implementation of an IndexInput that reads from a portion of the
  *  compound file.
@@ -58,7 +66,7 @@ protected:
 
 public:
     CSIndexInput(CL_NS(store)::IndexInput* base, const int64_t fileOffset, const int64_t length,
-                 const int32_t readBufferSize = CL_NS(store)::BufferedIndexInput::BUFFER_SIZE);
+                 const int32_t read_buffer_size = CL_NS(store)::BufferedIndexInput::BUFFER_SIZE);
     CSIndexInput(const CSIndexInput& clone);
     ~CSIndexInput() override;
     void close() override;
@@ -70,15 +78,15 @@ public:
 };
 
 CSIndexInput::CSIndexInput(CL_NS(store)::IndexInput* base, const int64_t fileOffset,
-                           const int64_t length, const int32_t _readBufferSize)
-        : BufferedIndexInput(_readBufferSize) {
+                           const int64_t length, const int32_t read_buffer_size)
+        : BufferedIndexInput(read_buffer_size) {
     this->base = base;
     this->fileOffset = fileOffset;
     this->_length = length;
 }
 
 void CSIndexInput::readInternal(uint8_t* b, const int32_t len) {
-    std::lock_guard<std::mutex> wlock(((DorisCompoundDirectory::FSIndexInput*)base)->_this_lock);
+    std::lock_guard wlock(((DorisFSDirectory::FSIndexInput*)base)->_this_lock);
 
     int64_t start = getFilePointer();
     if (start + len > _length) {
@@ -103,19 +111,13 @@ CSIndexInput::CSIndexInput(const CSIndexInput& clone) : BufferedIndexInput(clone
 
 void CSIndexInput::close() {}
 
-DorisCompoundReader::DorisCompoundReader(lucene::store::Directory* d, const char* name,
-                                         int32_t read_buffer_size)
-        : readBufferSize(read_buffer_size),
-          dir(d),
-          ram_dir(new lucene::store::RAMDirectory()),
-          file_name(name),
-          stream(nullptr),
-          entries(_CLNEW EntriesType(true, true)) {
-    bool success = false;
+DorisCompoundReader::DorisCompoundReader(CL_NS(store)::IndexInput* stream, int32_t read_buffer_size)
+        : _ram_dir(new lucene::store::RAMDirectory()),
+          _stream(stream),
+          _entries(_CLNEW EntriesType(true, true)),
+          _read_buffer_size(read_buffer_size) {
     try {
-        stream = dir->openInput(name, readBufferSize);
-
-        int32_t count = stream->readVInt();
+        int32_t count = _stream->readVInt();
         ReaderFileEntry* entry = nullptr;
         TCHAR tid[CL_MAX_PATH];
         uint8_t buffer[BUFFER_LENGTH];
@@ -126,37 +128,50 @@ DorisCompoundReader::DorisCompoundReader(lucene::store::Directory* d, const char
             entry->file_name = aid;
             entry->offset = stream->readLong();
             entry->length = stream->readLong();
-            entries->put(aid, entry);
+            DBUG_EXECUTE_IF("construct_DorisCompoundReader_failed", {
+                CLuceneError err;
+                err.set(CL_ERR_IO, "construct_DorisCompoundReader_failed");
+                throw err;
+            })
+            _entries->put(aid, entry);
             // read header file data
             if (entry->offset < 0) {
                 copyFile(entry->file_name.c_str(), entry->length, buffer, BUFFER_LENGTH);
             }
         }
-
-        success = true;
-    }
-    _CLFINALLY(if (!success && (stream != nullptr)) {
+    } catch (...) {
         try {
-            stream->close();
-            _CLDELETE(stream)
+            if (_stream != nullptr) {
+                _stream->close();
+                _CLDELETE(_stream)
+            }
+            if (_entries != nullptr) {
+                _entries->clear();
+                _CLDELETE(_entries);
+            }
+            if (_ram_dir) {
+                _ram_dir->close();
+                _CLDELETE(_ram_dir)
+            }
         } catch (CLuceneError& err) {
             if (err.number() != CL_ERR_IO) {
                 throw err;
             }
         }
-    })
+        throw;
+    }
 }
 
 void DorisCompoundReader::copyFile(const char* file, int64_t file_length, uint8_t* buffer,
                                    int64_t buffer_length) {
-    std::unique_ptr<lucene::store::IndexOutput> output(ram_dir->createOutput(file));
+    std::unique_ptr<lucene::store::IndexOutput> output(_ram_dir->createOutput(file));
     int64_t start_ptr = output->getFilePointer();
     int64_t remainder = file_length;
     int64_t chunk = buffer_length;
 
     while (remainder > 0) {
         int64_t len = std::min(std::min(chunk, file_length), remainder);
-        stream->readBytes(buffer, len);
+        _stream->readBytes(buffer, len);
         output->writeBytes(buffer, len);
         remainder -= len;
     }
@@ -165,7 +180,7 @@ void DorisCompoundReader::copyFile(const char* file, int64_t file_length, uint8_
         swprintf(buf, CL_MAX_PATH + 100,
                  _T("Non-zero remainder length after copying")
                  _T(": %d (id: %s, length: %d, buffer size: %d)"),
-                 (int)remainder, file_name.c_str(), (int)file_length, (int)chunk);
+                 (int)remainder, file, (int)file_length, (int)chunk);
         _CLTHROWT(CL_ERR_IO, buf);
     }
 
@@ -183,7 +198,14 @@ void DorisCompoundReader::copyFile(const char* file, int64_t file_length, uint8_
 }
 
 DorisCompoundReader::~DorisCompoundReader() {
-    _CLDELETE(entries)
+    if (!_closed) {
+        try {
+            close();
+        } catch (CLuceneError& err) {
+            LOG(ERROR) << "DorisCompoundReader finalize error:" << err.what();
+        }
+    }
+    _CLDELETE(_entries)
 }
 
 const char* DorisCompoundReader::getClassName() {
@@ -194,26 +216,22 @@ const char* DorisCompoundReader::getObjectName() const {
 }
 
 bool DorisCompoundReader::list(std::vector<std::string>* names) const {
-    for (EntriesType::const_iterator i = entries->begin(); i != entries->end(); i++) {
+    for (EntriesType::const_iterator i = _entries->begin(); i != _entries->end(); i++) {
         names->push_back(i->first);
     }
     return true;
 }
 
 bool DorisCompoundReader::fileExists(const char* name) const {
-    return entries->exists((char*)name);
-}
-
-lucene::store::Directory* DorisCompoundReader::getDirectory() {
-    return dir;
+    return _entries->exists((char*)name);
 }
 
 int64_t DorisCompoundReader::fileModified(const char* name) const {
-    return dir->fileModified(name);
+    return 0;
 }
 
 int64_t DorisCompoundReader::fileLength(const char* name) const {
-    ReaderFileEntry* e = entries->get((char*)name);
+    ReaderFileEntry* e = _entries->get((char*)name);
     if (e == nullptr) {
         char buf[CL_MAX_PATH + 30];
         strcpy(buf, "File ");
@@ -224,14 +242,25 @@ int64_t DorisCompoundReader::fileLength(const char* name) const {
     return e->length;
 }
 
+bool DorisCompoundReader::openInput(const char* name,
+                                    std::unique_ptr<lucene::store::IndexInput>& ret,
+                                    CLuceneError& error, int32_t bufferSize) {
+    lucene::store::IndexInput* tmp;
+    bool success = openInput(name, tmp, error, bufferSize);
+    if (success) {
+        ret.reset(tmp);
+    }
+    return success;
+}
+
 bool DorisCompoundReader::openInput(const char* name, lucene::store::IndexInput*& ret,
                                     CLuceneError& error, int32_t bufferSize) {
-    if (stream == nullptr) {
+    if (_stream == nullptr) {
         error.set(CL_ERR_IO, "Stream closed");
         return false;
     }
 
-    const ReaderFileEntry* entry = entries->get((char*)name);
+    const ReaderFileEntry* entry = _entries->get((char*)name);
     if (entry == nullptr) {
         char buf[CL_MAX_PATH + 26];
         snprintf(buf, CL_MAX_PATH + 26, "No sub-file with id %s found", name);
@@ -240,29 +269,32 @@ bool DorisCompoundReader::openInput(const char* name, lucene::store::IndexInput*
     }
 
     // If file is in RAM, just return.
-    if (ram_dir->fileExists(name)) {
-        return ram_dir->openInput(name, ret, error, bufferSize);
+    if (_ram_dir && _ram_dir->fileExists(name)) {
+        return _ram_dir->openInput(name, ret, error, bufferSize);
     }
 
     if (bufferSize < 1) {
-        bufferSize = readBufferSize;
+        bufferSize = _read_buffer_size;
     }
 
-    ret = _CLNEW CSIndexInput(stream, entry->offset, entry->length, bufferSize);
+    ret = _CLNEW CSIndexInput(_stream, entry->offset, entry->length, bufferSize);
     return true;
 }
 
 void DorisCompoundReader::close() {
     std::lock_guard<std::mutex> wlock(_this_lock);
-    if (stream != nullptr) {
-        entries->clear();
-        stream->close();
-        _CLDELETE(stream)
+    if (_stream != nullptr) {
+        _stream->close();
+        _CLDELETE(_stream)
     }
-    ram_dir->close();
-    dir->close();
-    _CLDECDELETE(dir)
-    _CLDELETE(ram_dir)
+    if (_entries != nullptr) {
+        _entries->clear();
+    }
+    if (_ram_dir) {
+        _ram_dir->close();
+        _CLDELETE(_ram_dir)
+    }
+    _closed = true;
 }
 
 bool DorisCompoundReader::doDeleteFile(const char* /*name*/) {
@@ -286,8 +318,11 @@ lucene::store::IndexOutput* DorisCompoundReader::createOutput(const char* /*name
 }
 
 std::string DorisCompoundReader::toString() const {
-    return std::string("DorisCompoundReader@") + this->directory + std::string("; file_name: ") +
-           std::string(file_name);
+    return std::string("DorisCompoundReader@");
+}
+
+CL_NS(store)::IndexInput* DorisCompoundReader::getDorisIndexInput() {
+    return _stream;
 }
 
 } // namespace segment_v2

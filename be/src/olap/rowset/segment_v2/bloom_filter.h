@@ -17,18 +17,44 @@
 
 #pragma once
 
+#include <bvar/reducer.h>
+#include <gen_cpp/segment_v2.pb.h>
+#include <glog/logging.h>
+#include <string.h>
+
 #include <cstdint>
 #include <functional>
 #include <memory>
 
 #include "common/status.h"
-#include "gen_cpp/segment_v2.pb.h"
-#include "gutil/strings/substitute.h"
-#include "olap/utils.h"
+#include "gutil/integral_types.h"
 #include "util/murmur_hash3.h"
 
 namespace doris {
 namespace segment_v2 {
+
+inline bvar::Adder<int64_t> g_total_bloom_filter_num("doris_total_bloom_filter_num");
+inline bvar::Adder<int64_t> g_read_bloom_filter_num("doris_read_bloom_filter_num");
+inline bvar::Adder<int64_t> g_write_bloom_filter_num("doris_write_bloom_filter_num");
+
+inline bvar::Adder<int64_t> g_total_bloom_filter_total_bytes("doris_total_bloom_filter_bytes");
+inline bvar::Adder<int64_t> g_read_bloom_filter_total_bytes("doris_read_bloom_filter_bytes");
+inline bvar::Adder<int64_t> g_write_bloom_filter_total_bytes("doris_write_bloom_filter_bytes");
+
+inline bvar::Adder<int64_t> g_pk_total_bloom_filter_num("doris_pk_total_bloom_filter_num");
+inline bvar::Adder<int64_t> g_pk_read_bloom_filter_num("doris_pk_read_bloom_filter_num");
+inline bvar::Adder<int64_t> g_pk_write_bloom_filter_increase_num(
+        "doris_pk_write_bloom_filter_increase_num");
+inline bvar::Adder<int64_t> g_pk_write_bloom_filter_decrease_num(
+        "doris_pk_write_bloom_filter_decrease_num");
+
+inline bvar::Adder<int64_t> g_pk_total_bloom_filter_total_bytes(
+        "doris_pk_total_bloom_filter_bytes");
+inline bvar::Adder<int64_t> g_pk_read_bloom_filter_total_bytes("doris_pk_read_bloom_filter_bytes");
+inline bvar::Adder<int64_t> g_pk_write_bloom_filter_increase_bytes(
+        "doris_pk_write_bloom_filter_increase_bytes");
+inline bvar::Adder<int64_t> g_pk_write_bloom_filter_decrease_bytes(
+        "doris_pk_write_bloom_filter_decrease_bytes");
 
 struct BloomFilterOptions {
     // false positive probability
@@ -54,12 +80,23 @@ public:
     static Status create(BloomFilterAlgorithmPB algorithm, std::unique_ptr<BloomFilter>* bf,
                          size_t bf_size = 0);
 
-    BloomFilter() : _data(nullptr), _num_bytes(0), _size(0), _has_null(nullptr) {}
+    BloomFilter() : _data(nullptr), _num_bytes(0), _size(0), _has_null(nullptr) {
+        g_total_bloom_filter_num << 1;
+    }
 
     virtual ~BloomFilter() {
         if (_data) {
+            if (_is_write) {
+                g_write_bloom_filter_total_bytes << -static_cast<int64_t>(_size);
+                g_write_bloom_filter_num << -1;
+            } else {
+                g_read_bloom_filter_total_bytes << -static_cast<int64_t>(_size);
+                g_read_bloom_filter_num << -1;
+            }
+            g_total_bloom_filter_total_bytes << -static_cast<int64_t>(_size);
             delete[] _data;
         }
+        g_total_bloom_filter_num << -1;
     }
 
     virtual bool is_ngram_bf() const { return false; }
@@ -85,6 +122,10 @@ public:
         memset(_data, 0, _size);
         _has_null = (bool*)(_data + _num_bytes);
         *_has_null = false;
+        _is_write = true;
+        g_write_bloom_filter_num << 1;
+        g_write_bloom_filter_total_bytes << _size;
+        g_total_bloom_filter_total_bytes << _size;
         return Status::OK();
     }
 
@@ -106,6 +147,9 @@ public:
         _num_bytes = _size - 1;
         DCHECK((_num_bytes & (_num_bytes - 1)) == 0);
         _has_null = (bool*)(_data + _num_bytes);
+        g_read_bloom_filter_num << 1;
+        g_read_bloom_filter_total_bytes << _size;
+        g_total_bloom_filter_total_bytes << _size;
         return Status::OK();
     }
 
@@ -171,7 +215,7 @@ public:
 protected:
     // bloom filter data
     // specially add one byte for null flag
-    char* _data;
+    char* _data = nullptr;
     // optimal bloom filter num bytes
     // it is calculated by optimal_bit_num() / 8
     uint32_t _num_bytes;
@@ -179,7 +223,9 @@ protected:
     // last byte is for has_null flag
     uint32_t _size;
     // last byte's pointer in data for null flag
-    bool* _has_null;
+    bool* _has_null = nullptr;
+    // is this bf used for write
+    bool _is_write = false;
 
 private:
     std::function<void(const void*, const int, const uint64_t, void*)> _hash_func;

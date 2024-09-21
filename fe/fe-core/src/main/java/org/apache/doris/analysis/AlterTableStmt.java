@@ -27,8 +27,8 @@ import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.UserException;
+import org.apache.doris.common.util.InternalDatabaseUtil;
 import org.apache.doris.common.util.PropertyAnalyzer;
-import org.apache.doris.common.util.Util;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.qe.ConnectContext;
 
@@ -37,7 +37,7 @@ import java.util.List;
 import java.util.Map;
 
 // Alter table statement.
-public class AlterTableStmt extends DdlStmt {
+public class AlterTableStmt extends DdlStmt implements NotFallbackInParser {
     private TableName tbl;
     private List<AlterClause> ops;
 
@@ -65,10 +65,10 @@ public class AlterTableStmt extends DdlStmt {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_TABLES_USED);
         }
         tbl.analyze(analyzer);
-        // disallow external catalog
-        Util.prohibitExternalCatalog(tbl.getCtl(), this.getClass().getSimpleName());
-        if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ConnectContext.get(), tbl.getDb(), tbl.getTbl(),
-                PrivPredicate.ALTER)) {
+        InternalDatabaseUtil.checkDatabase(tbl.getDb(), ConnectContext.get());
+        if (!Env.getCurrentEnv().getAccessManager()
+                .checkTblPriv(ConnectContext.get(), tbl.getCtl(), tbl.getDb(), tbl.getTbl(),
+                        PrivPredicate.ALTER)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "ALTER TABLE",
                     ConnectContext.get().getQualifiedUser(),
                     ConnectContext.get().getRemoteIP(),
@@ -206,5 +206,10 @@ public class AlterTableStmt extends DdlStmt {
     @Override
     public String toString() {
         return toSql();
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.ALTER;
     }
 }

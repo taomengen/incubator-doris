@@ -17,15 +17,14 @@
 
 #include "olap/hll.h"
 
-#include <algorithm>
+#include <cmath>
 #include <map>
+#include <ostream>
 
 #include "common/logging.h"
 #include "util/coding.h"
-#include "vec/common/string_ref.h"
+#include "util/slice.h"
 
-using std::map;
-using std::nothrow;
 using std::string;
 using std::stringstream;
 
@@ -49,7 +48,7 @@ void HyperLogLog::_convert_explicit_to_register() {
         _update_registers(value);
     }
     // clear _hash_set
-    phmap::flat_hash_set<uint64_t>().swap(_hash_set);
+    vectorized::flat_hash_set<uint64_t>().swap(_hash_set);
 }
 
 // Change HLL_DATA_EXPLICIT to HLL_DATA_FULL directly, because HLL_DATA_SPARSE
@@ -326,27 +325,27 @@ int64_t HyperLogLog::estimate_cardinality() const {
     float alpha = 0;
 
     if (num_streams == 16) {
-        alpha = 0.673f;
+        alpha = 0.673F;
     } else if (num_streams == 32) {
-        alpha = 0.697f;
+        alpha = 0.697F;
     } else if (num_streams == 64) {
-        alpha = 0.709f;
+        alpha = 0.709F;
     } else {
-        alpha = 0.7213f / (1 + 1.079f / num_streams);
+        alpha = 0.7213F / (1 + 1.079F / num_streams);
     }
 
     float harmonic_mean = 0;
     int num_zero_registers = 0;
 
     for (int i = 0; i < HLL_REGISTERS_COUNT; ++i) {
-        harmonic_mean += powf(2.0f, -_registers[i]);
+        harmonic_mean += powf(2.0F, -_registers[i]);
 
         if (_registers[i] == 0) {
             ++num_zero_registers;
         }
     }
 
-    harmonic_mean = 1.0f / harmonic_mean;
+    harmonic_mean = 1.0F / harmonic_mean;
     double estimate = alpha * num_streams * num_streams * harmonic_mean;
     // according to HyperLogLog current correction, if E is cardinal
     // E =< num_streams * 2.5 , LC has higher accuracy.
@@ -389,9 +388,9 @@ void HllSetResolver::parse() {
         _sparse_count = (SparseLengthValueType*)(pdata + sizeof(SetTypeValueType));
         sparse_data = pdata + sizeof(SetTypeValueType) + sizeof(SparseLengthValueType);
         for (int i = 0; i < *_sparse_count; i++) {
-            SparseIndexType* index = (SparseIndexType*)sparse_data;
+            auto* index = (SparseIndexType*)sparse_data;
             sparse_data += sizeof(SparseIndexType);
-            SparseValueType* value = (SparseValueType*)sparse_data;
+            auto* value = (SparseValueType*)sparse_data;
             _sparse_map[*index] = *value;
             sparse_data += sizeof(SetTypeValueType);
         }

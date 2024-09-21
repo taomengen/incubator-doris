@@ -26,40 +26,51 @@ import org.apache.doris.analysis.CompoundPredicate;
 import org.apache.doris.analysis.Expr;
 import org.apache.doris.analysis.ExprId;
 import org.apache.doris.analysis.ExprSubstitutionMap;
-import org.apache.doris.analysis.FunctionName;
+import org.apache.doris.analysis.FunctionCallExpr;
+import org.apache.doris.analysis.SlotDescriptor;
 import org.apache.doris.analysis.SlotId;
 import org.apache.doris.analysis.SlotRef;
 import org.apache.doris.analysis.TupleDescriptor;
 import org.apache.doris.analysis.TupleId;
-import org.apache.doris.catalog.Function;
+import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.OlapTable;
-import org.apache.doris.catalog.Type;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.Id;
 import org.apache.doris.common.NotImplementedException;
+import org.apache.doris.common.Pair;
 import org.apache.doris.common.TreeNode;
 import org.apache.doris.common.UserException;
-import org.apache.doris.common.util.VectorizedUtil;
+import org.apache.doris.planner.normalize.Normalizer;
 import org.apache.doris.statistics.PlanStats;
 import org.apache.doris.statistics.StatisticalType;
 import org.apache.doris.statistics.StatsDeriveResult;
 import org.apache.doris.thrift.TExplainLevel;
-import org.apache.doris.thrift.TFunctionBinaryType;
+import org.apache.doris.thrift.TExpr;
+import org.apache.doris.thrift.TNormalizedPlanNode;
 import org.apache.doris.thrift.TPlan;
 import org.apache.doris.thrift.TPlanNode;
+import org.apache.doris.thrift.TPushAggOp;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import org.apache.commons.collections.CollectionUtils;
 
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
 import java.util.Set;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
 
 /**
  * Each PlanNode represents a single relational operator
@@ -100,8 +111,6 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
 
     protected List<Expr> conjuncts = Lists.newArrayList();
 
-    protected Expr vconjunct = null;
-
     // Conjuncts used to filter the original load file.
     // In the load execution plan, the difference between "preFilterConjuncts" and "conjuncts" is that
     // conjuncts are used to filter the data after column conversion and mapping,
@@ -124,6 +133,8 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
     // invalid: -1
     protected long cardinality;
 
+    protected long cardinalityAfterFilter = -1;
+
     // number of nodes on which the plan tree rooted at this node would execute;
     // set in computeStats(); invalid: -1
     protected int numNodes;
@@ -133,12 +144,16 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
 
     //  Node should compact data.
     protected boolean compactData;
+    // Most of the plan node has the same numInstance as its (left) child, except some special nodes, such as
+    // 1. scan node, whose numInstance is calculated according to its data distribution
+    // 2. exchange node, which is gather distribution
+    // 3. union node, whose numInstance is the sum of its children's numInstance
+    // ...
+    // only special nodes need to call setNumInstances() and getNumInstances() from attribute numInstances
     protected int numInstances;
 
     // Runtime filters assigned to this node.
     protected List<RuntimeFilter> runtimeFilters = new ArrayList<>();
-
-    private boolean cardinalityIsDone = false;
 
     protected List<SlotId> outputSlotIds;
 
@@ -149,6 +164,12 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
 
     protected List<Expr> projectList;
 
+    protected int nereidsId = -1;
+
+    private List<List<Expr>> childrenDistributeExprLists = new ArrayList<>();
+    private List<TupleDescriptor> intermediateOutputTupleDescList = Lists.newArrayList();
+    private List<List<Expr>> intermediateProjectListList = Lists.newArrayList();
+
     protected PlanNode(PlanNodeId id, ArrayList<TupleId> tupleIds, String planNodeName,
             StatisticalType statisticalType) {
         this.id = id;
@@ -158,7 +179,7 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
         this.tupleIds = Lists.newArrayList(tupleIds);
         this.tblRefIds = Lists.newArrayList(tupleIds);
         this.cardinality = -1;
-        this.planNodeName = VectorizedUtil.isVectorized() ? "V" + planNodeName : planNodeName;
+        this.planNodeName = "V" + planNodeName;
         this.numInstances = 1;
         this.statisticalType = statisticalType;
     }
@@ -169,7 +190,7 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
         this.tupleIds = Lists.newArrayList();
         this.tblRefIds = Lists.newArrayList();
         this.cardinality = -1;
-        this.planNodeName = VectorizedUtil.isVectorized() ? "V" + planNodeName : planNodeName;
+        this.planNodeName = "V" + planNodeName;
         this.numInstances = 1;
         this.statisticalType = statisticalType;
     }
@@ -187,7 +208,7 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
         this.conjuncts = Expr.cloneList(node.conjuncts, null);
         this.cardinality = -1;
         this.compactData = node.compactData;
-        this.planNodeName = VectorizedUtil.isVectorized() ? "V" + planNodeName : planNodeName;
+        this.planNodeName = "V" + planNodeName;
         this.numInstances = 1;
         this.statisticalType = statisticalType;
     }
@@ -254,6 +275,10 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
         this.fragment = fragment;
     }
 
+    public boolean isNullAwareLeftAntiJoin() {
+        return children.stream().anyMatch(PlanNode::isNullAwareLeftAntiJoin);
+    }
+
     public PlanFragment getFragment() {
         return fragment;
     }
@@ -314,6 +339,14 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
         return cardinality;
     }
 
+    public long getCardinalityAfterFilter() {
+        if (cardinalityAfterFilter < 0) {
+            return cardinality;
+        } else {
+            return cardinalityAfterFilter;
+        }
+    }
+
     public int getNumNodes() {
         return numNodes;
     }
@@ -368,6 +401,9 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
     }
 
     public List<TupleId> getOutputTupleIds() {
+        if (outputTupleDesc != null) {
+            return Lists.newArrayList(outputTupleDesc.getId());
+        }
         return tupleIds;
     }
 
@@ -389,25 +425,7 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
         return statsDeriveResultList;
     }
 
-    protected void initCompoundPredicate(Expr expr) {
-        if (expr instanceof CompoundPredicate) {
-            CompoundPredicate compoundPredicate = (CompoundPredicate) expr;
-            compoundPredicate.setType(Type.BOOLEAN);
-            List<Type> args = new ArrayList<>();
-            args.add(Type.BOOLEAN);
-            args.add(Type.BOOLEAN);
-            Function function = new Function(new FunctionName("", compoundPredicate.getOp().toString()),
-                    args, Type.BOOLEAN, false);
-            function.setBinaryType(TFunctionBinaryType.BUILTIN);
-            expr.setFn(function);
-        }
-
-        for (Expr child : expr.getChildren()) {
-            initCompoundPredicate(child);
-        }
-    }
-
-    protected Expr convertConjunctsToAndCompoundPredicate(List<Expr> conjuncts) {
+    public static Expr convertConjunctsToAndCompoundPredicate(List<Expr> conjuncts) {
         List<Expr> targetConjuncts = Lists.newArrayList(conjuncts);
         while (targetConjuncts.size() > 1) {
             List<Expr> newTargetConjuncts = Lists.newArrayList();
@@ -422,6 +440,21 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
 
         Preconditions.checkArgument(targetConjuncts.size() == 1);
         return targetConjuncts.get(0);
+    }
+
+    public static List<Expr> splitAndCompoundPredicateToConjuncts(Expr vconjunct) {
+        List<Expr> conjuncts = Lists.newArrayList();
+        if (vconjunct instanceof CompoundPredicate) {
+            CompoundPredicate andCompound = (CompoundPredicate) vconjunct;
+            if (andCompound.getOp().equals(CompoundPredicate.Operator.AND)) {
+                conjuncts.addAll(splitAndCompoundPredicateToConjuncts(vconjunct.getChild(0)));
+                conjuncts.addAll(splitAndCompoundPredicateToConjuncts(vconjunct.getChild(1)));
+            }
+        }
+        if (vconjunct != null && conjuncts.isEmpty()) {
+            conjuncts.add(vconjunct);
+        }
+        return conjuncts;
     }
 
     public void addConjuncts(List<Expr> conjuncts) {
@@ -451,9 +484,6 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
     }
 
     public void transferConjuncts(PlanNode recipient) {
-        recipient.vconjunct = vconjunct;
-        vconjunct = null;
-
         recipient.conjuncts.addAll(conjuncts);
         conjuncts.clear();
     }
@@ -510,15 +540,35 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
         // Print the current node
         // The plan node header line will be prefixed by rootPrefix and the remaining details
         // will be prefixed by detailPrefix.
-        expBuilder.append(rootPrefix + id.asInt() + ":" + planNodeName + "\n");
+        expBuilder.append(rootPrefix + id.asInt() + ":" + planNodeName);
+        if (nereidsId != -1) {
+            expBuilder.append("(" + nereidsId + ")");
+        }
+        expBuilder.append("\n");
         expBuilder.append(getNodeExplainString(detailPrefix, detailLevel));
         if (limit != -1) {
             expBuilder.append(detailPrefix + "limit: " + limit + "\n");
         }
         if (!CollectionUtils.isEmpty(projectList)) {
-            expBuilder.append(detailPrefix).append("projections: ").append(getExplainString(projectList)).append("\n");
-            expBuilder.append(detailPrefix).append("project output tuple id: ")
+            expBuilder.append(detailPrefix).append("final projections: ")
+                .append(getExplainString(projectList)).append("\n");
+            expBuilder.append(detailPrefix).append("final project output tuple id: ")
                     .append(outputTupleDesc.getId().asInt()).append("\n");
+        }
+        if (!intermediateProjectListList.isEmpty()) {
+            int layers = intermediateProjectListList.size();
+            for (int i = layers - 1; i >= 0; i--) {
+                expBuilder.append(detailPrefix).append("intermediate projections: ")
+                        .append(getExplainString(intermediateProjectListList.get(i))).append("\n");
+                expBuilder.append(detailPrefix).append("intermediate tuple id: ")
+                        .append(intermediateOutputTupleDescList.get(i).getId().asInt()).append("\n");
+            }
+        }
+        if (!CollectionUtils.isEmpty(childrenDistributeExprLists)) {
+            for (List<Expr> distributeExprList : childrenDistributeExprLists) {
+                expBuilder.append(detailPrefix).append("distribute expr lists: ")
+                    .append(getExplainString(distributeExprList)).append("\n");
+            }
         }
         // Output Tuple Ids only when explain plan level is set to verbose
         if (detailLevel.equals(TExplainLevel.VERBOSE)) {
@@ -547,6 +597,27 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
         return expBuilder.toString();
     }
 
+    private String getplanNodeExplainString(String prefix, TExplainLevel detailLevel) {
+        StringBuilder expBuilder = new StringBuilder();
+        expBuilder.append(getNodeExplainString(prefix, detailLevel));
+        if (limit != -1) {
+            expBuilder.append(prefix + "limit: " + limit + "\n");
+        }
+        if (!CollectionUtils.isEmpty(projectList)) {
+            expBuilder.append(prefix).append("projections: ").append(getExplainString(projectList)).append("\n");
+            expBuilder.append(prefix).append("project output tuple id: ")
+                    .append(outputTupleDesc.getId().asInt()).append("\n");
+        }
+        return expBuilder.toString();
+    }
+
+    public void getExplainStringMap(TExplainLevel detailLevel, Map<Integer, String> planNodeMap) {
+        planNodeMap.put(id.asInt(), getplanNodeExplainString("", detailLevel));
+        for (int i = 0; i < children.size(); ++i) {
+            children.get(i).getExplainStringMap(detailLevel, planNodeMap);
+        }
+    }
+
     /**
      * Return the node-specific details.
      * Subclass should override this function.
@@ -567,15 +638,16 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
     private void treeToThriftHelper(TPlan container) {
         TPlanNode msg = new TPlanNode();
         msg.node_id = id.asInt();
+        msg.setNereidsId(nereidsId);
         msg.num_children = children.size();
         msg.limit = limit;
         for (TupleId tid : tupleIds) {
             msg.addToRowTuples(tid.asInt());
             msg.addToNullableTuples(nullableTupleIds.contains(tid));
         }
-        // `conjuncts` is never needed on vectorized engine except scan nodes which use them as push-down predicates.
-        if (this instanceof ScanNode || !VectorizedUtil.isVectorized()) {
-            for (Expr e : conjuncts) {
+
+        for (Expr e : conjuncts) {
+            if  (!(e instanceof BitmapFilterPredicate)) {
                 msg.addToConjuncts(e.treeToThrift());
             }
         }
@@ -585,26 +657,47 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
             msg.addToRuntimeFilters(filter.toThrift());
         }
 
-        if (vconjunct != null) {
-            msg.vconjunct = vconjunct.treeToThrift();
-        }
-
         msg.compact_data = compactData;
         if (outputSlotIds != null) {
             for (SlotId slotId : outputSlotIds) {
                 msg.addToOutputSlotIds(slotId.asInt());
             }
         }
-        toThrift(msg);
-        container.addToNodes(msg);
-        if (projectList != null) {
-            for (Expr expr : projectList) {
-                msg.addToProjections(expr.treeToThrift());
+        if (!CollectionUtils.isEmpty(childrenDistributeExprLists)) {
+            for (List<Expr> exprList : childrenDistributeExprLists) {
+                msg.addToDistributeExprLists(new ArrayList<>());
+                for (Expr expr : exprList) {
+                    msg.distribute_expr_lists.get(msg.distribute_expr_lists.size() - 1).add(expr.treeToThrift());
+                }
             }
         }
-        if (outputTupleDesc != null) {
-            msg.setOutputTupleId(outputTupleDesc.getId().asInt());
+        toThrift(msg);
+        container.addToNodes(msg);
+
+        // legacy planner set outputTuple and projections inside join node
+        if (!(this instanceof JoinNodeBase) || !(((JoinNodeBase) this).isUseSpecificProjections())) {
+            if (outputTupleDesc != null) {
+                msg.setOutputTupleId(outputTupleDesc.getId().asInt());
+            }
+            if (projectList != null) {
+                for (Expr expr : projectList) {
+                    msg.addToProjections(expr.treeToThrift());
+                }
+            }
         }
+
+        if (!intermediateOutputTupleDescList.isEmpty()) {
+            intermediateOutputTupleDescList
+                    .forEach(
+                            tupleDescriptor -> msg.addToIntermediateOutputTupleIdList(tupleDescriptor.getId().asInt()));
+        }
+
+        if (!intermediateProjectListList.isEmpty()) {
+            intermediateProjectListList.forEach(
+                    projectList -> msg.addToIntermediateProjectionsList(
+                            projectList.stream().map(expr -> expr.treeToThrift()).collect(Collectors.toList())));
+        }
+
         if (this instanceof ExchangeNode) {
             msg.num_children = 0;
             return;
@@ -622,13 +715,6 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
      * Subclasses need to override this.
      */
     public void finalize(Analyzer analyzer) throws UserException {
-        for (PlanNode child : children) {
-            child.finalize(analyzer);
-        }
-        computeNumNodes();
-        if (!analyzer.safeIsEnableJoinReorderBasedCost()) {
-            computeOldCardinality();
-        }
         for (Expr expr : conjuncts) {
             Set<SlotRef> slotRefs = new HashSet<>();
             expr.getSlotRefsBoundByTupleIds(tupleIds, slotRefs);
@@ -638,6 +724,13 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
             for (TupleId tupleId : tupleIds) {
                 analyzer.getTupleDesc(tupleId).computeMemLayout();
             }
+        }
+        for (PlanNode child : children) {
+            child.finalize(analyzer);
+        }
+        computeNumNodes();
+        if (!analyzer.safeIsEnableJoinReorderBasedCost()) {
+            computeOldCardinality();
         }
     }
 
@@ -717,6 +810,10 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
      * Assign remaining unassigned conjuncts.
      */
     protected void assignConjuncts(Analyzer analyzer) {
+        // we cannot plan conjuncts on exchange node, so we just skip the node.
+        if (this instanceof ExchangeNode) {
+            return;
+        }
         List<Expr> unassigned = analyzer.getUnassignedConjuncts(this);
         for (Expr unassignedConjunct : unassigned) {
             addConjunct(unassignedConjunct);
@@ -796,6 +893,90 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
     // the node type and the node-specific field.
     protected abstract void toThrift(TPlanNode msg);
 
+    public TNormalizedPlanNode normalize(Normalizer normalizer) {
+        TNormalizedPlanNode normalizedPlan = new TNormalizedPlanNode();
+        normalizedPlan.setNodeId(normalizer.normalizePlanId(id.asInt()));
+        normalizedPlan.setNumChildren(children.size());
+        Set<Integer> tupleIds = this.tupleIds
+                .stream()
+                .map(Id::asInt)
+                .collect(Collectors.toSet());
+        normalizedPlan.setTupleIds(
+                tupleIds.stream()
+                    .map(normalizer::normalizeTupleId)
+                    .collect(Collectors.toSet())
+        );
+        normalizedPlan.setNullableTuples(
+                nullableTupleIds
+                    .stream()
+                    .map(Id::asInt)
+                    .filter(tupleIds::contains)
+                    .map(normalizer::normalizeTupleId)
+                    .collect(Collectors.toSet())
+        );
+        normalize(normalizedPlan, normalizer);
+        normalizeConjuncts(normalizedPlan, normalizer);
+        normalizeProjects(normalizedPlan, normalizer);
+        normalizedPlan.setLimit(limit);
+        return normalizedPlan;
+    }
+
+    public void normalize(TNormalizedPlanNode normalizedPlan, Normalizer normalizer) {
+        throw new IllegalStateException("Unsupported normalization");
+    }
+
+    protected void normalizeProjects(TNormalizedPlanNode normalizedPlanNode, Normalizer normalizer) {
+        throw new IllegalStateException("Unsupported normalize project for " + getClass().getSimpleName());
+    }
+
+    public List<TExpr> normalizeProjects(
+            List<SlotDescriptor> outputSlotDescs, List<Expr> projects, Normalizer normalizer) {
+        Map<SlotId, Expr> outputSlotToProject = Maps.newLinkedHashMap();
+        for (int i = 0; i < outputSlotDescs.size(); i++) {
+            SlotId slotId = outputSlotDescs.get(i).getId();
+            Expr projectExpr = projects.get(i);
+            if (projectExpr instanceof SlotRef) {
+                int outputSlotId = slotId.asInt();
+                int refId = ((SlotRef) projectExpr).getSlotId().asInt();
+                normalizer.setSlotIdToNormalizeId(outputSlotId, normalizer.normalizeSlotId(refId));
+            }
+            outputSlotToProject.put(slotId, projectExpr);
+        }
+        return normalizeProjects(outputSlotToProject, normalizer);
+    }
+
+    protected void normalizeConjuncts(TNormalizedPlanNode normalizedPlan, Normalizer normalizer) {
+        normalizedPlan.setConjuncts(normalizeExprs(getConjuncts(), normalizer));
+    }
+
+    protected List<TExpr> normalizeProjects(Map<SlotId, Expr> project, Normalizer normalizer) {
+        List<Pair<SlotId, TExpr>> sortByTExpr = Lists.newArrayListWithCapacity(project.size());
+        for (Entry<SlotId, Expr> kv : project.entrySet()) {
+            SlotId slotId = kv.getKey();
+            Expr expr = kv.getValue();
+            TExpr thriftExpr = expr.normalize(normalizer);
+            sortByTExpr.add(Pair.of(slotId, thriftExpr));
+        }
+        sortByTExpr.sort(Comparator.comparing(Pair::value));
+
+        // we should normalize slot id by fix order, then the upper nodes can reference the same normalized slot id
+        for (Pair<SlotId, TExpr> pair : sortByTExpr) {
+            int originOutputSlotId = pair.first.asInt();
+            normalizer.normalizeSlotId(originOutputSlotId);
+        }
+
+        return sortByTExpr.stream().map(Pair::value).collect(Collectors.toList());
+    }
+
+    public static List<TExpr> normalizeExprs(Collection<? extends Expr> exprs, Normalizer normalizer) {
+        List<TExpr> normalizedWithoutSort = Lists.newArrayListWithCapacity(exprs.size());
+        for (Expr expr : exprs) {
+            normalizedWithoutSort.add(expr.normalize(normalizer));
+        }
+        normalizedWithoutSort.sort(Comparator.naturalOrder());
+        return normalizedWithoutSort;
+    }
+
     protected String debugString() {
         // not using Objects.toStrHelper because
         StringBuilder output = new StringBuilder();
@@ -804,7 +985,7 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
         return output.toString();
     }
 
-    protected String getExplainString(List<? extends Expr> exprs) {
+    public static String getExplainString(List<? extends Expr> exprs) {
         if (exprs == null) {
             return "";
         }
@@ -826,7 +1007,13 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
     }
 
     public int getNumInstances() {
-        return numInstances;
+        return this.children.get(0).getNumInstances();
+    }
+
+    public void setShouldColoScan() {}
+
+    public boolean getShouldColoScan() {
+        return false;
     }
 
     public void setNumInstances(int numInstances) {
@@ -930,6 +1117,25 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
         }
     }
 
+    /**
+     * find planNode recursively based on the planNodeId
+     */
+    public static PlanNode findPlanNodeFromPlanNodeId(PlanNode root, PlanNodeId id) {
+        if (root == null || root.getId() == null || id == null) {
+            return null;
+        } else if (root.getId().equals(id)) {
+            return root;
+        } else {
+            for (PlanNode child : root.getChildren()) {
+                PlanNode retNode = findPlanNodeFromPlanNodeId(child, id);
+                if (retNode != null) {
+                    return retNode;
+                }
+            }
+            return null;
+        }
+    }
+
     public String getPlanTreeExplainStr() {
         StringBuilder sb = new StringBuilder();
         sb.append("[").append(getId().asInt()).append(": ").append(getPlanNodeName()).append("]");
@@ -1003,49 +1209,13 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
         }
         List<String> filtersStr = new ArrayList<>();
         for (RuntimeFilter filter : runtimeFilters) {
-            StringBuilder filterStr = new StringBuilder();
-            filterStr.append(filter.getFilterId());
-            if (!isBrief) {
-                filterStr.append("[");
-                filterStr.append(filter.getType().toString().toLowerCase());
-                filterStr.append("]");
-                if (isBuildNode) {
-                    filterStr.append(" <- ");
-                    filterStr.append(filter.getSrcExpr().toSql());
-                } else {
-                    filterStr.append(" -> ");
-                    filterStr.append(filter.getTargetExpr(getId()).toSql());
-                }
-            }
-            filtersStr.add(filterStr.toString());
+            filtersStr.add(filter.getExplainString(isBuildNode, isBrief, getId()));
         }
         return Joiner.on(", ").join(filtersStr) + "\n";
     }
 
     protected String getRuntimeFilterExplainString(boolean isBuildNode) {
         return getRuntimeFilterExplainString(isBuildNode, false);
-    }
-
-    public void convertToVectorized() {
-        List<Expr> conjunctsExcludeBitmapFilter = Lists.newArrayList();
-        for (Expr expr : conjuncts) {
-            if (!(expr instanceof BitmapFilterPredicate)) {
-                conjunctsExcludeBitmapFilter.add(expr);
-            }
-        }
-        if (!conjunctsExcludeBitmapFilter.isEmpty()) {
-            vconjunct = convertConjunctsToAndCompoundPredicate(conjunctsExcludeBitmapFilter);
-            initCompoundPredicate(vconjunct);
-        }
-
-        if (!preFilterConjuncts.isEmpty()) {
-            vpreFilterConjunct = convertConjunctsToAndCompoundPredicate(preFilterConjuncts);
-            initCompoundPredicate(vpreFilterConjunct);
-        }
-
-        for (PlanNode child : children) {
-            child.convertToVectorized();
-        }
     }
 
     /**
@@ -1140,7 +1310,68 @@ public abstract class PlanNode extends TreeNode<PlanNode> implements PlanStats {
         return outputSlotIds;
     }
 
-    public void setVConjunct(Set<Expr> exprs) {
-        vconjunct = convertConjunctsToAndCompoundPredicate(new ArrayList<>(exprs));
+    public void setConjuncts(Set<Expr> exprs) {
+        conjuncts = new ArrayList<>(exprs);
+    }
+
+    public void setCardinalityAfterFilter(long cardinalityAfterFilter) {
+        this.cardinalityAfterFilter = cardinalityAfterFilter;
+    }
+
+    protected TPushAggOp pushDownAggNoGroupingOp = TPushAggOp.NONE;
+
+    public void setPushDownAggNoGrouping(TPushAggOp pushDownAggNoGroupingOp) {
+        this.pushDownAggNoGroupingOp = pushDownAggNoGroupingOp;
+    }
+
+    public void setChildrenDistributeExprLists(List<List<Expr>> childrenDistributeExprLists) {
+        this.childrenDistributeExprLists = childrenDistributeExprLists;
+    }
+
+    public TPushAggOp getPushDownAggNoGroupingOp() {
+        return pushDownAggNoGroupingOp;
+    }
+
+    public boolean pushDownAggNoGrouping(FunctionCallExpr aggExpr) {
+        return false;
+    }
+
+    public boolean pushDownAggNoGroupingCheckCol(FunctionCallExpr aggExpr, Column col) {
+        return false;
+    }
+
+    public void setNereidsId(int nereidsId) {
+        this.nereidsId = nereidsId;
+    }
+
+    public void addIntermediateOutputTupleDescList(TupleDescriptor tupleDescriptor) {
+        intermediateOutputTupleDescList.add(tupleDescriptor);
+    }
+
+    public void addIntermediateProjectList(List<Expr> exprs) {
+        intermediateProjectListList.add(exprs);
+    }
+
+    public <T extends PlanNode> List<T> collectInCurrentFragment(Predicate<PlanNode> predicate) {
+        List<PlanNode> result = Lists.newArrayList();
+        foreachDownInCurrentFragment(child -> {
+            if (predicate.test(child)) {
+                result.add(child);
+            }
+        });
+        return (List) result;
+    }
+
+    /** foreachDownInCurrentFragment */
+    public void foreachDownInCurrentFragment(Consumer<PlanNode> visitor) {
+        int currentFragmentId = getFragmentId().asInt();
+        foreachDown(child -> {
+            PlanNode childNode = (PlanNode) child;
+            if (childNode.getFragmentId().asInt() != currentFragmentId) {
+                return false;
+            }
+            visitor.accept(childNode);
+            return true;
+        });
     }
 }

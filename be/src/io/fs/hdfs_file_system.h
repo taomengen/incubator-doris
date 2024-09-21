@@ -17,118 +17,79 @@
 
 #pragma once
 
-#include <gen_cpp/PlanNodes_types.h>
-#include <hdfs/hdfs.h>
+#include <glog/logging.h>
+#include <stdint.h>
 
 #include <atomic>
+// IWYU pragma: no_include <bits/chrono.h>
+#include <chrono> // IWYU pragma: keep
+#include <memory>
+#include <string>
+#include <vector>
 
+#include "common/config.h"
+#include "common/status.h"
+#include "io/fs/hdfs.h"
+#include "io/fs/path.h"
 #include "io/fs/remote_file_system.h"
+#include "util/runtime_profile.h"
+
 namespace doris {
+class THdfsParams;
 
 namespace io {
+struct FileInfo;
+class HdfsHandler;
 
-class HdfsFileSystemHandle {
-public:
-    HdfsFileSystemHandle(hdfsFS fs, bool cached)
-            : hdfs_fs(fs), from_cache(cached), _ref_cnt(0), _last_access_time(0), _invalid(false) {}
-
-    ~HdfsFileSystemHandle() {
-        DCHECK(_ref_cnt == 0);
-        if (hdfs_fs != nullptr) {
-            // Even if there is an error, the resources associated with the hdfsFS will be freed.
-            hdfsDisconnect(hdfs_fs);
-        }
-        hdfs_fs = nullptr;
-    }
-
-    int64_t last_access_time() { return _last_access_time; }
-
-    void inc_ref() {
-        _ref_cnt++;
-        _last_access_time = _now();
-    }
-
-    void dec_ref() {
-        _ref_cnt--;
-        _last_access_time = _now();
-    }
-
-    int ref_cnt() { return _ref_cnt; }
-
-    bool invalid() { return _invalid; }
-
-    void set_invalid() { _invalid = true; }
-
-    hdfsFS hdfs_fs;
-    // When cache is full, and all handlers are in use, HdfsFileSystemCache will return an uncached handler.
-    // Client should delete the handler in such case.
-    const bool from_cache;
-
-private:
-    // the number of referenced client
-    std::atomic<int> _ref_cnt;
-    // HdfsFileSystemCache try to remove the oldest handler when the cache is full
-    std::atomic<uint64_t> _last_access_time;
-    // Client will set invalid if error thrown, and HdfsFileSystemCache will not reuse this handler
-    std::atomic<bool> _invalid;
-
-    uint64_t _now() {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(
-                       std::chrono::system_clock::now().time_since_epoch())
-                .count();
-    }
-};
-
+// Only accepts full path now.
+// Full path format: name_node/path_to_file
+// TODO(plat1ko): Support related path for cloud mode
 class HdfsFileSystem final : public RemoteFileSystem {
 public:
-    static std::shared_ptr<HdfsFileSystem> create(const THdfsParams& hdfs_params,
-                                                  const std::string& path);
+    static Result<std::shared_ptr<HdfsFileSystem>> create(const THdfsParams& hdfs_params,
+                                                          std::string fs_name, std::string id,
+                                                          RuntimeProfile* profile,
+                                                          std::string root_path = "");
+
+    static Result<std::shared_ptr<HdfsFileSystem>> create(
+            const std::map<std::string, std::string>& properties, std::string fs_name,
+            std::string id, RuntimeProfile* profile, std::string root_path = "");
 
     ~HdfsFileSystem() override;
 
-    Status create_file(const Path& path, FileWriterPtr* writer) override;
+protected:
+    Status create_file_impl(const Path& file, FileWriterPtr* writer,
+                            const FileWriterOptions* opts) override;
+    Status open_file_internal(const Path& file, FileReaderSPtr* reader,
+                              const FileReaderOptions& opts) override;
+    Status create_directory_impl(const Path& dir, bool failed_if_exists = false) override;
+    Status delete_file_impl(const Path& file) override;
+    Status delete_directory_impl(const Path& dir) override;
+    Status batch_delete_impl(const std::vector<Path>& files) override;
+    Status exists_impl(const Path& path, bool* res) const override;
+    Status file_size_impl(const Path& file, int64_t* file_size) const override;
+    Status list_impl(const Path& dir, bool only_file, std::vector<FileInfo>* files,
+                     bool* exists) override;
+    Status rename_impl(const Path& orig_name, const Path& new_name) override;
 
-    Status open_file(const Path& path, FileReaderSPtr* reader, IOContext* io_ctx) override;
-
-    Status delete_file(const Path& path) override;
-
-    Status create_directory(const Path& path) override;
-
-    // Delete all files under path.
-    Status delete_directory(const Path& path) override;
-
-    Status link_file(const Path& /*src*/, const Path& /*dest*/) override {
-        return Status::NotSupported("Not supported");
-    }
-
-    Status exists(const Path& path, bool* res) const override;
-
-    Status file_size(const Path& path, size_t* file_size) const override;
-
-    Status list(const Path& path, std::vector<Path>* files) override;
-
-    Status upload(const Path& /*local_path*/, const Path& /*dest_path*/) override {
-        return Status::NotSupported("Currently not support to upload file to HDFS");
-    }
-
-    Status batch_upload(const std::vector<Path>& /*local_paths*/,
-                        const std::vector<Path>& /*dest_paths*/) override {
-        return Status::NotSupported("Currently not support to batch upload file to HDFS");
-    }
-
-    Status connect() override;
-
-    HdfsFileSystemHandle* get_handle();
+    Status upload_impl(const Path& local_file, const Path& remote_file) override;
+    Status batch_upload_impl(const std::vector<Path>& local_files,
+                             const std::vector<Path>& remote_files) override;
+    Status download_impl(const Path& remote_file, const Path& local_file) override;
 
 private:
-    HdfsFileSystem(const THdfsParams& hdfs_params, const std::string& path);
+    Status init();
 
-    Path _covert_path(const Path& path) const;
-    const THdfsParams& _hdfs_params;
-    std::string _namenode;
-    // do not use std::shared_ptr or std::unique_ptr
-    // _fs_handle is managed by HdfsFileSystemCache
-    HdfsFileSystemHandle* _fs_handle;
+    Status delete_internal(const Path& path, int is_recursive);
+
+private:
+    friend class HdfsFileWriter;
+    HdfsFileSystem(const THdfsParams& hdfs_params, std::string fs_name, std::string id,
+                   RuntimeProfile* profile, std::string root_path);
+    const THdfsParams& _hdfs_params; // Only used in init, so we can use reference here
+    std::string _fs_name;
+    std::shared_ptr<HdfsHandler> _fs_handle = nullptr;
+    RuntimeProfile* _profile = nullptr;
 };
 } // namespace io
 } // namespace doris

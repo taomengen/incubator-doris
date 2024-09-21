@@ -45,6 +45,8 @@
 
 namespace doris {
 
+using int128_t = __int128;
+
 template <class OS_TYPE>
 class JsonbWriterT {
 public:
@@ -77,7 +79,7 @@ public:
 
     // write a key string (or key id if an external dict is provided)
     uint32_t writeKey(const char* key, uint8_t len, hDictInsert handler = nullptr) {
-        if (len && !stack_.empty() && verifyKeyState()) {
+        if (!stack_.empty() && verifyKeyState()) {
             int key_id = -1;
             if (handler) {
                 key_id = handler(key, len);
@@ -86,9 +88,16 @@ public:
             uint32_t size = sizeof(uint8_t);
             if (key_id < 0) {
                 os_->put(len);
-                os_->write(key, len);
-                size += len;
-            } else if (key_id <= JsonbKeyValue::sMaxKeyId) {
+                if (len == 0) {
+                    // NOTE: we use sMaxKeyId to represent an empty key
+                    JsonbKeyValue::keyid_type idx = JsonbKeyValue::sMaxKeyId;
+                    os_->write((char*)&idx, sizeof(JsonbKeyValue::keyid_type));
+                    size += sizeof(JsonbKeyValue::keyid_type);
+                } else {
+                    os_->write(key, len);
+                    size += len;
+                }
+            } else if (key_id < JsonbKeyValue::sMaxKeyId) {
                 JsonbKeyValue::keyid_type idx = key_id;
                 os_->put(0);
                 os_->write((char*)&idx, sizeof(JsonbKeyValue::keyid_type));
@@ -234,10 +243,11 @@ public:
         return 0;
     }
 
-    uint32_t writeInt128(__int128_t v) {
+    uint32_t writeInt128(int128_t v) {
         if ((first_ && stack_.empty()) || (!stack_.empty() && verifyValueState())) {
+            if (!writeFirstHeader()) return 0;
             os_->put((JsonbTypeUnder)JsonbType::T_Int128);
-            os_->write((char*)&v, sizeof(__int128_t));
+            os_->write((char*)&v, sizeof(int128_t));
             kvState_ = WS_Value;
             return sizeof(JsonbInt128Val);
         }
@@ -540,7 +550,7 @@ private:
     };
 
 private:
-    OS_TYPE* os_;
+    OS_TYPE* os_ = nullptr;
     bool alloc_;
     bool hasHdr_;
     WriteState kvState_; // key or value state

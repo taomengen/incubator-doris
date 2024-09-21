@@ -21,16 +21,43 @@
 
 #pragma once
 
+#include <string.h>
+
+#include <algorithm>
 #include <bitset>
+#include <boost/iterator/iterator_facade.hpp>
+#include <cstdint>
+#include <functional>
+#include <iterator>
+#include <memory>
+#include <ostream>
 #include <stack>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
 
 #include "common/logging.h"
+#include "util/binary_cast.hpp"
 #include "vec/aggregate_functions/aggregate_function.h"
-#include "vec/columns/column_array.h"
+#include "vec/columns/column_string.h"
+#include "vec/columns/column_vector.h"
 #include "vec/columns/columns_number.h"
-#include "vec/data_types/data_type_decimal.h"
+#include "vec/common/assert_cast.h"
+#include "vec/common/pod_array_fwd.h"
+#include "vec/common/string_ref.h"
+#include "vec/core/types.h"
+#include "vec/data_types/data_type_number.h"
 #include "vec/io/io_helper.h"
-#include "vec/io/var_int.h"
+
+namespace doris {
+namespace vectorized {
+class Arena;
+class BufferReadable;
+class BufferWritable;
+class IColumn;
+} // namespace vectorized
+} // namespace doris
 
 namespace doris::vectorized {
 
@@ -174,7 +201,7 @@ private:
 
     using PatternActions = PODArrayWithStackMemory<PatternAction, 64>;
 
-    Derived& derived() { return static_cast<Derived&>(*this); }
+    Derived& derived() { return assert_cast<Derived&, TypeCheckOnRelease::DISABLE>(*this); }
 
     void parse_pattern() {
         actions.clear();
@@ -572,19 +599,25 @@ public:
 
     void reset(AggregateDataPtr __restrict place) const override { this->data(place).reset(); }
 
-    void add(AggregateDataPtr __restrict place, const IColumn** columns, const size_t row_num,
+    void add(AggregateDataPtr __restrict place, const IColumn** columns, const ssize_t row_num,
              Arena*) const override {
         std::string pattern =
-                assert_cast<const ColumnString*>(columns[0])->get_data_at(0).to_string();
+                assert_cast<const ColumnString*, TypeCheckOnRelease::DISABLE>(columns[0])
+                        ->get_data_at(0)
+                        .to_string();
         this->data(place).init(pattern, arg_count);
 
         const auto& timestamp =
-                static_cast<const ColumnVector<NativeType>&>(*columns[1]).get_data()[row_num];
+                assert_cast<const ColumnVector<NativeType>&, TypeCheckOnRelease::DISABLE>(
+                        *columns[1])
+                        .get_data()[row_num];
         typename AggregateFunctionSequenceMatchData<DateValueType, NativeType, Derived>::Events
                 events;
 
         for (auto i = 2; i < arg_count; i++) {
-            const auto event = assert_cast<const ColumnUInt8*>(columns[i])->get_data()[row_num];
+            const auto event =
+                    assert_cast<const ColumnUInt8*, TypeCheckOnRelease::DISABLE>(columns[i])
+                            ->get_data()[row_num];
             events.set(i - 2, event);
         }
 

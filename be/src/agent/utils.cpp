@@ -17,22 +17,43 @@
 
 #include "agent/utils.h"
 
+// IWYU pragma: no_include <bthread/errno.h>
+#include <errno.h> // IWYU pragma: keep
+#include <fmt/format.h>
+#include <gen_cpp/FrontendService.h>
+#include <gen_cpp/HeartbeatService_types.h>
+#include <gen_cpp/Types_types.h>
+#include <glog/logging.h>
 #include <rapidjson/document.h>
+#include <rapidjson/encodings.h>
 #include <rapidjson/rapidjson.h>
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <thrift/transport/TTransportException.h>
 
 #include <cstdio>
+#include <exception>
 #include <fstream>
-#include <sstream>
+#include <memory>
+#include <utility>
 
+#include "common/config.h"
 #include "common/status.h"
 #include "runtime/client_cache.h"
 
+namespace doris {
+class TConfirmUnusedRemoteFilesRequest;
+class TConfirmUnusedRemoteFilesResult;
+class TFinishTaskRequest;
+class TMasterResult;
+class TReportRequest;
+} // namespace doris
+
 using std::map;
 using std::string;
-using std::stringstream;
-using apache::thrift::TException;
 using apache::thrift::transport::TTransportException;
 
 namespace doris {
@@ -68,20 +89,24 @@ Status MasterServerClient::finish_task(const TFinishTaskRequest& request, TMaste
     try {
         try {
             client->finishTask(*result, request);
-        } catch (TTransportException& e) {
+        } catch ([[maybe_unused]] TTransportException& e) {
+#ifdef ADDRESS_SANITIZER
             LOG(WARNING) << "master client, retry finishTask: " << e.what();
+#endif
             client_status = client.reopen(config::thrift_rpc_timeout_ms);
             if (!client_status.ok()) {
+#ifdef ADDRESS_SANITIZER
                 LOG(WARNING) << "fail to get master client from cache. "
                              << "host=" << _master_info.network_address.hostname
                              << ", port=" << _master_info.network_address.port
                              << ", code=" << client_status.code();
-                return Status::InternalError("Master client finish task failed");
+#endif
+                return Status::RpcError("Master client finish task failed");
             }
             client->finishTask(*result, request);
         }
-    } catch (TException& e) {
-        client.reopen(config::thrift_rpc_timeout_ms);
+    } catch (std::exception& e) {
+        RETURN_IF_ERROR(client.reopen(config::thrift_rpc_timeout_ms));
         LOG(WARNING) << "fail to finish_task. "
                      << "host=" << _master_info.network_address.hostname
                      << ", port=" << _master_info.network_address.port << ", error=" << e.what();
@@ -110,15 +135,19 @@ Status MasterServerClient::report(const TReportRequest& request, TMasterResult* 
         } catch (TTransportException& e) {
             TTransportException::TTransportExceptionType type = e.getType();
             if (type != TTransportException::TTransportExceptionType::TIMED_OUT) {
+#ifdef ADDRESS_SANITIZER
                 // if not TIMED_OUT, retry
                 LOG(WARNING) << "master client, retry finishTask: " << e.what();
+#endif
 
                 client_status = client.reopen(config::thrift_rpc_timeout_ms);
                 if (!client_status.ok()) {
+#ifdef ADDRESS_SANITIZER
                     LOG(WARNING) << "fail to get master client from cache. "
                                  << "host=" << _master_info.network_address.hostname
                                  << ", port=" << _master_info.network_address.port
                                  << ", code=" << client_status.code();
+#endif
                     return Status::InternalError("Fail to get master client from cache");
                 }
 
@@ -126,12 +155,14 @@ Status MasterServerClient::report(const TReportRequest& request, TMasterResult* 
             } else {
                 // TIMED_OUT exception. do not retry
                 // actually we don't care what FE returns.
+#ifdef ADDRESS_SANITIZER
                 LOG(WARNING) << "fail to report to master: " << e.what();
+#endif
                 return Status::InternalError("Fail to report to master");
             }
         }
-    } catch (TException& e) {
-        client.reopen(config::thrift_rpc_timeout_ms);
+    } catch (std::exception& e) {
+        RETURN_IF_ERROR(client.reopen(config::thrift_rpc_timeout_ms));
         LOG(WARNING) << "fail to report to master. "
                      << "host=" << _master_info.network_address.hostname
                      << ", port=" << _master_info.network_address.port
@@ -181,8 +212,8 @@ Status MasterServerClient::confirm_unused_remote_files(
                         client_status.code(), e.what());
             }
         }
-    } catch (TException& e) {
-        client.reopen(config::thrift_rpc_timeout_ms);
+    } catch (std::exception& e) {
+        RETURN_IF_ERROR(client.reopen(config::thrift_rpc_timeout_ms));
         return Status::InternalError(
                 "fail to confirm unused remote files. host={}, port={}, code={}, reason={}",
                 _master_info.network_address.hostname, _master_info.network_address.port,
@@ -205,9 +236,7 @@ bool AgentUtils::exec_cmd(const string& command, string* errmsg, bool redirect_s
     // Execute command.
     FILE* fp = popen(cmd.c_str(), "r");
     if (fp == nullptr) {
-        std::stringstream err_stream;
-        err_stream << "popen failed. " << strerror(errno) << ", with errno: " << errno << ".\n";
-        *errmsg = err_stream.str();
+        *errmsg = fmt::format("popen failed. {}, with errno: {}.\n", strerror(errno), errno);
         return false;
     }
 
@@ -223,10 +252,8 @@ bool AgentUtils::exec_cmd(const string& command, string* errmsg, bool redirect_s
         if (errno == ECHILD) {
             *errmsg += "pclose cannot obtain the child status.\n";
         } else {
-            std::stringstream err_stream;
-            err_stream << "Close popen failed. " << strerror(errno) << ", with errno: " << errno
-                       << "\n";
-            *errmsg += err_stream.str();
+            *errmsg += fmt::format("Close popen failed. {}, with errno: {}.\n", strerror(errno),
+                                   errno);
         }
         return false;
     }

@@ -33,12 +33,13 @@ import org.apache.doris.analysis.UseStmt;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.jmockit.Deencapsulation;
-import org.apache.doris.common.util.RuntimeProfile;
+import org.apache.doris.common.profile.Profile;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.metric.MetricRepo;
 import org.apache.doris.mysql.MysqlChannel;
 import org.apache.doris.mysql.MysqlSerializer;
 import org.apache.doris.planner.OriginalPlanner;
+import org.apache.doris.qe.ConnectContext.ConnectType;
 import org.apache.doris.rewrite.ExprRewriter;
 import org.apache.doris.service.FrontendOptions;
 import org.apache.doris.thrift.TQueryOptions;
@@ -86,9 +87,20 @@ public class StmtExecutorTest {
         ctx = new ConnectContext();
 
         SessionVariable sessionVariable = new SessionVariable();
+        new Expectations(ctx) {
+            {
+                ctx.getSessionVariable();
+                minTimes = 0;
+                result = sessionVariable;
+
+                ConnectContext.get().getSessionVariable();
+                minTimes = 0;
+                result = sessionVariable;
+            }
+        };
+
         MysqlSerializer serializer = MysqlSerializer.newInstance();
         Env env = AccessTestUtil.fetchAdminCatalog();
-
         new Expectations(channel) {
             {
                 channel.sendOnePacket((ByteBuffer) any);
@@ -152,11 +164,7 @@ public class StmtExecutorTest {
 
                 ctx.getDatabase();
                 minTimes = 0;
-                result = "testCluster:testDb";
-
-                ctx.getSessionVariable();
-                minTimes = 0;
-                result = sessionVariable;
+                result = "testDb";
 
                 ctx.setStmtId(anyLong);
                 minTimes = 0;
@@ -172,7 +180,8 @@ public class StmtExecutorTest {
     public void testSelect(@Mocked QueryStmt queryStmt,
                            @Mocked SqlParser parser,
                            @Mocked OriginalPlanner planner,
-                           @Mocked Coordinator coordinator) throws Exception {
+                           @Mocked Coordinator coordinator,
+                           @Mocked Profile profile) throws Exception {
         Env env = Env.getCurrentEnv();
         Deencapsulation.setField(env, "canRead", new AtomicBoolean(true));
 
@@ -214,13 +223,6 @@ public class StmtExecutorTest {
                 // mock coordinator
                 coordinator.exec();
                 minTimes = 0;
-
-                coordinator.endProfile();
-                minTimes = 0;
-
-                coordinator.getQueryProfile();
-                minTimes = 0;
-                result = new RuntimeProfile();
 
                 coordinator.getNext();
                 minTimes = 0;
@@ -388,6 +390,10 @@ public class StmtExecutorTest {
                 killCtx.kill(true);
                 minTimes = 0;
 
+                killCtx.getConnectType();
+                minTimes = 0;
+                result = ConnectType.MYSQL;
+
                 ConnectContext.get();
                 minTimes = 0;
                 result = ctx;
@@ -444,6 +450,10 @@ public class StmtExecutorTest {
 
                 killCtx.kill(true);
                 minTimes = 0;
+
+                killCtx.getConnectType();
+                minTimes = 0;
+                result = ConnectType.MYSQL;
 
                 ConnectContext.get();
                 minTimes = 0;
@@ -533,7 +543,7 @@ public class StmtExecutorTest {
     public void testStmtWithUserInfo(@Mocked StatementBase stmt, @Mocked ConnectContext context) throws Exception {
         StmtExecutor stmtExecutor = new StmtExecutor(ctx, stmt);
         Deencapsulation.setField(stmtExecutor, "parsedStmt", null);
-        Deencapsulation.setField(stmtExecutor, "originStmt", new OriginStatement("show databases;", 1));
+        Deencapsulation.setField(stmtExecutor, "originStmt", new OriginStatement("show databases;", 0));
         stmtExecutor.execute();
         StatementBase newstmt = Deencapsulation.getField(stmtExecutor, "parsedStmt");
         Assert.assertNotNull(newstmt.getUserInfo());
@@ -679,15 +689,11 @@ public class StmtExecutorTest {
 
                 useStmt.getDatabase();
                 minTimes = 0;
-                result = "testCluster:testDb";
+                result = "testDb";
 
                 useStmt.getRedirectStatus();
                 minTimes = 0;
                 result = RedirectStatus.NO_FORWARD;
-
-                useStmt.getClusterName();
-                minTimes = 0;
-                result = "testCluster";
 
                 Symbol symbol = new Symbol(0, Lists.newArrayList(useStmt));
                 parser.parse();
@@ -717,10 +723,6 @@ public class StmtExecutorTest {
                 minTimes = 0;
                 result = RedirectStatus.NO_FORWARD;
 
-                useStmt.getClusterName();
-                minTimes = 0;
-                result = "testCluster";
-
                 Symbol symbol = new Symbol(0, Lists.newArrayList(useStmt));
                 parser.parse();
                 minTimes = 0;
@@ -743,15 +745,11 @@ public class StmtExecutorTest {
 
                 useStmt.getDatabase();
                 minTimes = 0;
-                result = "testCluster:testDb";
+                result = "testDb";
 
                 useStmt.getRedirectStatus();
                 minTimes = 0;
                 result = RedirectStatus.NO_FORWARD;
-
-                useStmt.getClusterName();
-                minTimes = 0;
-                result = "testCluster";
 
                 useStmt.getCatalogName();
                 minTimes = 0;
@@ -784,10 +782,6 @@ public class StmtExecutorTest {
                 useStmt.getRedirectStatus();
                 minTimes = 0;
                 result = RedirectStatus.NO_FORWARD;
-
-                useStmt.getClusterName();
-                minTimes = 0;
-                result = "testCluster";
 
                 useStmt.getCatalogName();
                 minTimes = 0;

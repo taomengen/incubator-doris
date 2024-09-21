@@ -18,26 +18,41 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 
+#include "common/status.h"
 #include "io/fs/file_reader.h"
-#include "io/fs/local_file_system.h"
+#include "io/fs/file_system.h"
 #include "io/fs/path.h"
+#include "util/slice.h"
 
 namespace doris {
-namespace io {
+struct StorePath;
+struct DataDirInfo;
+struct CachePath;
+} // namespace doris
+
+namespace doris::io {
+
+struct BeConfDataDirReader {
+    static std::vector<doris::DataDirInfo> be_config_data_dir_list;
+
+    static void get_data_dir_by_file_path(Path* file_path, std::string* data_dir_arg);
+
+    static void init_be_conf_data_dir(const std::vector<doris::StorePath>& store_paths,
+                                      const std::vector<doris::StorePath>& spill_store_paths,
+                                      const std::vector<doris::CachePath>& cache_paths);
+};
+
+struct IOContext;
 
 class LocalFileReader final : public FileReader {
 public:
-    LocalFileReader(Path path, size_t file_size, int fd, std::shared_ptr<LocalFileSystem> fs);
+    LocalFileReader(Path path, size_t file_size, int fd);
 
     ~LocalFileReader() override;
 
     Status close() override;
-
-    Status read_at(size_t offset, Slice result, const IOContext& io_ctx,
-                   size_t* bytes_read) override;
-
-    Status read_at_impl(size_t offset, Slice result, const IOContext& io_ctx, size_t* bytes_read);
 
     const Path& path() const override { return _path; }
 
@@ -45,15 +60,18 @@ public:
 
     bool closed() const override { return _closed.load(std::memory_order_acquire); }
 
-    FileSystemSPtr fs() const override { return _fs; }
+    const std::string& get_data_dir_path() override { return _data_dir_path; }
+
+private:
+    Status read_at_impl(size_t offset, Slice result, size_t* bytes_read,
+                        const IOContext* io_ctx) override;
 
 private:
     int _fd = -1; // owned
     Path _path;
     size_t _file_size;
     std::atomic<bool> _closed = false;
-    std::shared_ptr<LocalFileSystem> _fs;
+    std::string _data_dir_path; // be conf's data dir path
 };
 
-} // namespace io
-} // namespace doris
+} // namespace doris::io

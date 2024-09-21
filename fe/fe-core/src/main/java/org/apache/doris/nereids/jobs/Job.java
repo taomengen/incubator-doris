@@ -17,8 +17,6 @@
 
 package org.apache.doris.nereids.jobs;
 
-import org.apache.doris.nereids.CascadesContext;
-import org.apache.doris.nereids.StatementContext;
 import org.apache.doris.nereids.memo.CopyInResult;
 import org.apache.doris.nereids.memo.Group;
 import org.apache.doris.nereids.memo.GroupExpression;
@@ -33,19 +31,17 @@ import org.apache.doris.nereids.metrics.event.CounterEvent;
 import org.apache.doris.nereids.metrics.event.TransformEvent;
 import org.apache.doris.nereids.rules.Rule;
 import org.apache.doris.nereids.rules.RuleSet;
+import org.apache.doris.nereids.trees.expressions.CTEId;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.qe.ConnectContext;
-import org.apache.doris.qe.SessionVariable;
+import org.apache.doris.statistics.Statistics;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableSet;
 
+import java.util.BitSet;
 import java.util.List;
-import java.util.Objects;
+import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
-import java.util.function.Function;
 
 /**
  * Abstract class for all job using for analyze and optimize query plan in Nereids.
@@ -59,7 +55,9 @@ public abstract class Job implements TracerSupplier {
     protected JobType type;
     protected JobContext context;
     protected boolean once;
-    protected final Set<String> disableRules;
+    protected final BitSet disableRules;
+
+    protected Map<CTEId, Statistics> cteIdToStats;
 
     public Job(JobType type, JobContext context) {
         this(type, context, true);
@@ -85,27 +83,8 @@ public abstract class Job implements TracerSupplier {
         return once;
     }
 
-    /**
-     * Get the rule set of this job. Filter out already applied rules and rules that are not matched on root node.
-     *
-     * @param groupExpression group expression to be applied on
-     * @param candidateRules rules to be applied
-     * @return all rules that can be applied on this group expression
-     */
-    public List<Rule> getValidRules(GroupExpression groupExpression, List<Rule> candidateRules) {
-        return candidateRules.stream()
-                .filter(rule -> Objects.nonNull(rule)
-                        && !disableRules.contains(rule.getRuleType().name())
-                        && rule.getPattern().matchRoot(groupExpression.getPlan())
-                        && groupExpression.notApplied(rule))
-                .collect(ImmutableList.toImmutableList());
-    }
-
-    public List<Rule> getValidRules(List<Rule> candidateRules) {
-        return candidateRules.stream()
-                .filter(rule -> Objects.nonNull(rule)
-                        && !disableRules.contains(rule.getRuleType().name()))
-                .collect(ImmutableList.toImmutableList());
+    public ConnectContext getConnectContext() {
+        return context.getCascadesContext().getConnectContext();
     }
 
     public abstract void execute();
@@ -148,30 +127,7 @@ public abstract class Job implements TracerSupplier {
                 groupExpression.getOwnerGroup(), groupExpression, groupExpression.getPlan()));
     }
 
-    public static Set<String> getDisableRules(JobContext context) {
-        return getAndCacheSessionVariable(context, "disableNereidsRules",
-                ImmutableSet.of(), SessionVariable::getDisableNereidsRules);
-    }
-
-    public static boolean isTraceEnable(JobContext context) {
-        return getAndCacheSessionVariable(context, "isTraceEnable",
-                false, SessionVariable::isEnableNereidsTrace);
-    }
-
-    private static <T> T getAndCacheSessionVariable(JobContext context, String cacheName,
-            T defaultValue, Function<SessionVariable, T> variableSupplier) {
-        CascadesContext cascadesContext = context.getCascadesContext();
-        ConnectContext connectContext = cascadesContext.getConnectContext();
-        if (connectContext == null) {
-            return defaultValue;
-        }
-
-        StatementContext statementContext = cascadesContext.getStatementContext();
-        if (statementContext == null) {
-            return defaultValue;
-        }
-        T cacheResult = statementContext.getOrRegisterCache(cacheName,
-                () -> variableSupplier.apply(connectContext.getSessionVariable()));
-        return cacheResult;
+    public static BitSet getDisableRules(JobContext context) {
+        return context.getCascadesContext().getAndCacheDisableRules();
     }
 }

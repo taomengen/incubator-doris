@@ -41,6 +41,7 @@ import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jetbrains.annotations.NotNull;
@@ -68,6 +69,9 @@ import javax.servlet.http.HttpServletResponse;
 public class StmtExecutionAction extends RestBaseController {
     private static final Logger LOG = LogManager.getLogger(StmtExecutionAction.class);
     private static StatementSubmitter stmtSubmitter = new StatementSubmitter();
+    private static final String  NEW_LINE_PATTERN = "[\n\r]";
+
+    private static final String NEW_LINE_REPLACEMENT = " ";
 
     private static final long DEFAULT_ROW_LIMIT = 1000;
     private static final long MAX_ROW_LIMIT = 10000;
@@ -84,6 +88,10 @@ public class StmtExecutionAction extends RestBaseController {
     @RequestMapping(path = "/api/query/{" + NS_KEY + "}/{" + DB_KEY + "}", method = {RequestMethod.POST})
     public Object executeSQL(@PathVariable(value = NS_KEY) String ns, @PathVariable(value = DB_KEY) String dbName,
             HttpServletRequest request, HttpServletResponse response, @RequestBody String body) {
+        if (needRedirect(request.getScheme())) {
+            return redirectToHttps(request);
+        }
+
         ActionAuthorizationInfo authInfo = checkWithCookie(request, response, false);
         String fullDbName = getFullDbName(dbName);
         if (Config.enable_all_http_auth) {
@@ -105,7 +113,7 @@ public class StmtExecutionAction extends RestBaseController {
                 stmtRequestBody.limit);
 
         ConnectContext.get().changeDefaultCatalog(ns);
-        ConnectContext.get().setDatabase(getFullDbName(dbName));
+        ConnectContext.get().setDatabase(fullDbName);
 
         String streamHeader = request.getHeader("X-Doris-Stream");
         boolean isStream = !("false".equalsIgnoreCase(streamHeader));
@@ -125,15 +133,21 @@ public class StmtExecutionAction extends RestBaseController {
      * @return plain text of create table stmts
      */
     @RequestMapping(path = "/api/query_schema/{" + NS_KEY + "}/{" + DB_KEY + "}", method = {RequestMethod.POST})
-    public String querySchema(@PathVariable(value = NS_KEY) String ns, @PathVariable(value = DB_KEY) String dbName,
+    public Object querySchema(@PathVariable(value = NS_KEY) String ns, @PathVariable(value = DB_KEY) String dbName,
             HttpServletRequest request, HttpServletResponse response, @RequestBody String sql) {
+        if (needRedirect(request.getScheme())) {
+            return redirectToHttps(request);
+        }
+
         checkWithCookie(request, response, false);
 
         if (ns.equalsIgnoreCase(SystemInfoService.DEFAULT_CLUSTER)) {
             ns = InternalCatalog.INTERNAL_CATALOG_NAME;
         }
+        if (StringUtils.isNotBlank(sql)) {
+            sql = sql.replaceAll(NEW_LINE_PATTERN, NEW_LINE_REPLACEMENT);
+        }
         LOG.info("sql: {}", sql);
-
         ConnectContext.get().changeDefaultCatalog(ns);
         ConnectContext.get().setDatabase(getFullDbName(dbName));
         return getSchema(sql);
@@ -151,7 +165,7 @@ public class StmtExecutionAction extends RestBaseController {
     private ResponseEntity executeQuery(ActionAuthorizationInfo authInfo, boolean isSync, long limit,
             StmtRequestBody stmtRequestBody, HttpServletResponse response, boolean isStream) {
         StatementSubmitter.StmtContext stmtCtx = new StatementSubmitter.StmtContext(stmtRequestBody.stmt,
-                authInfo.fullUserName, authInfo.password, limit, isStream, response);
+                authInfo.fullUserName, authInfo.password, limit, isStream, response, "");
         Future<ExecutionResultSet> future = stmtSubmitter.submit(stmtCtx);
 
         if (isSync) {
@@ -162,10 +176,7 @@ public class StmtExecutionAction extends RestBaseController {
                     return null;
                 }
                 return ResponseEntityBuilder.ok(resultSet.getResult());
-            } catch (InterruptedException e) {
-                LOG.warn("failed to execute stmt", e);
-                return ResponseEntityBuilder.okWithCommonError("Failed to execute sql: " + e.getMessage());
-            } catch (ExecutionException e) {
+            } catch (InterruptedException | ExecutionException e) {
                 LOG.warn("failed to execute stmt", e);
                 return ResponseEntityBuilder.okWithCommonError("Failed to execute sql: " + e.getMessage());
             }

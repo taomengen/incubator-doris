@@ -19,11 +19,13 @@ package org.apache.doris.nereids.trees.plans.physical;
 
 import org.apache.doris.nereids.memo.GroupExpression;
 import org.apache.doris.nereids.properties.LogicalProperties;
+import org.apache.doris.nereids.properties.OrderKey;
 import org.apache.doris.nereids.properties.PhysicalProperties;
 import org.apache.doris.nereids.properties.RequireProperties;
 import org.apache.doris.nereids.properties.RequirePropertiesSupplier;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
+import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.functions.agg.AggregateParam;
 import org.apache.doris.nereids.trees.plans.AggMode;
 import org.apache.doris.nereids.trees.plans.AggPhase;
@@ -31,6 +33,7 @@ import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.algebra.Aggregate;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
+import org.apache.doris.nereids.util.MutableState;
 import org.apache.doris.nereids.util.Utils;
 import org.apache.doris.statistics.Statistics;
 
@@ -87,7 +90,7 @@ public class PhysicalHashAggregate<CHILD_TYPE extends Plan> extends PhysicalUnar
             Optional<List<Expression>> partitionExpressions, AggregateParam aggregateParam, boolean maybeUsingStream,
             Optional<GroupExpression> groupExpression, LogicalProperties logicalProperties,
             RequireProperties requireProperties, CHILD_TYPE child) {
-        super(PlanType.PHYSICAL_AGGREGATE, groupExpression, logicalProperties, child);
+        super(PlanType.PHYSICAL_HASH_AGGREGATE, groupExpression, logicalProperties, child);
         this.groupByExpressions = ImmutableList.copyOf(
                 Objects.requireNonNull(groupByExpressions, "groupByExpressions cannot be null"));
         this.outputExpressions = ImmutableList.copyOf(
@@ -113,7 +116,7 @@ public class PhysicalHashAggregate<CHILD_TYPE extends Plan> extends PhysicalUnar
             Optional<GroupExpression> groupExpression, LogicalProperties logicalProperties,
             RequireProperties requireProperties, PhysicalProperties physicalProperties,
             Statistics statistics, CHILD_TYPE child) {
-        super(PlanType.PHYSICAL_AGGREGATE, groupExpression, logicalProperties, physicalProperties, statistics,
+        super(PlanType.PHYSICAL_HASH_AGGREGATE, groupExpression, logicalProperties, physicalProperties, statistics,
                 child);
         this.groupByExpressions = ImmutableList.copyOf(
                 Objects.requireNonNull(groupByExpressions, "groupByExpressions cannot be null"));
@@ -131,6 +134,11 @@ public class PhysicalHashAggregate<CHILD_TYPE extends Plan> extends PhysicalUnar
     }
 
     public List<NamedExpression> getOutputExpressions() {
+        return outputExpressions;
+    }
+
+    @Override
+    public List<NamedExpression> getOutputs() {
         return outputExpressions;
     }
 
@@ -182,7 +190,10 @@ public class PhysicalHashAggregate<CHILD_TYPE extends Plan> extends PhysicalUnar
 
     @Override
     public String toString() {
-        return Utils.toSqlString("PhysicalHashAggregate[" + id.asInt() + "]" + getGroupIdAsString(),
+        TopnPushInfo topnPushInfo = (TopnPushInfo) getMutableState(
+                MutableState.KEY_PUSH_TOPN_TO_AGG).orElseGet(() -> null);
+        return Utils.toSqlString("PhysicalHashAggregate[" + id.asInt() + "]" + getGroupIdWithPrefix(),
+                "stats", statistics,
                 "aggPhase", aggregateParam.aggPhase,
                 "aggMode", aggregateParam.aggMode,
                 "maybeUseStreaming", maybeUsingStream,
@@ -190,7 +201,7 @@ public class PhysicalHashAggregate<CHILD_TYPE extends Plan> extends PhysicalUnar
                 "outputExpr", outputExpressions,
                 "partitionExpr", partitionExpressions,
                 "requireProperties", requireProperties,
-                "stats", statistics
+                "topnOpt", topnPushInfo != null
         );
     }
 
@@ -223,7 +234,9 @@ public class PhysicalHashAggregate<CHILD_TYPE extends Plan> extends PhysicalUnar
     public PhysicalHashAggregate<Plan> withChildren(List<Plan> children) {
         Preconditions.checkArgument(children.size() == 1);
         return new PhysicalHashAggregate<>(groupByExpressions, outputExpressions, partitionExpressions,
-                aggregateParam, maybeUsingStream, getLogicalProperties(), requireProperties, children.get(0));
+                aggregateParam, maybeUsingStream, groupExpression, getLogicalProperties(),
+                requireProperties, physicalProperties, statistics,
+                children.get(0));
     }
 
     public PhysicalHashAggregate<CHILD_TYPE> withPartitionExpressions(List<Expression> partitionExpressions) {
@@ -239,10 +252,12 @@ public class PhysicalHashAggregate<CHILD_TYPE extends Plan> extends PhysicalUnar
     }
 
     @Override
-    public PhysicalHashAggregate<CHILD_TYPE> withLogicalProperties(Optional<LogicalProperties> logicalProperties) {
+    public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
+            Optional<LogicalProperties> logicalProperties, List<Plan> children) {
+        Preconditions.checkArgument(children.size() == 1);
         return new PhysicalHashAggregate<>(groupByExpressions, outputExpressions, partitionExpressions,
-                aggregateParam, maybeUsingStream, Optional.empty(), logicalProperties.get(),
-                requireProperties, child());
+                aggregateParam, maybeUsingStream, groupExpression, logicalProperties.get(),
+                requireProperties, children.get(0));
     }
 
     @Override
@@ -257,7 +272,7 @@ public class PhysicalHashAggregate<CHILD_TYPE extends Plan> extends PhysicalUnar
     @Override
     public PhysicalHashAggregate<CHILD_TYPE> withAggOutput(List<NamedExpression> newOutput) {
         return new PhysicalHashAggregate<>(groupByExpressions, newOutput, partitionExpressions,
-                aggregateParam, maybeUsingStream, groupExpression, getLogicalProperties(),
+                aggregateParam, maybeUsingStream, Optional.empty(), getLogicalProperties(),
                 requireProperties, physicalProperties, statistics, child());
     }
 
@@ -266,5 +281,53 @@ public class PhysicalHashAggregate<CHILD_TYPE extends Plan> extends PhysicalUnar
         return new PhysicalHashAggregate<>(groupByExpressions, outputExpressions, partitionExpressions,
                 aggregateParam, maybeUsingStream, Optional.empty(), getLogicalProperties(),
                 requireProperties, physicalProperties, statistics, newChild);
+    }
+
+    @Override
+    public String shapeInfo() {
+        StringBuilder builder = new StringBuilder("hashAgg[");
+        builder.append(getAggPhase()).append("]");
+        return builder.toString();
+    }
+
+    @Override
+    public List<Slot> computeOutput() {
+        return outputExpressions.stream()
+                .map(NamedExpression::toSlot)
+                .collect(ImmutableList.toImmutableList());
+    }
+
+    @Override
+    public PhysicalHashAggregate<CHILD_TYPE> resetLogicalProperties() {
+        return new PhysicalHashAggregate<>(groupByExpressions, outputExpressions, partitionExpressions,
+                aggregateParam, maybeUsingStream, groupExpression, null,
+                requireProperties, physicalProperties, statistics,
+                child());
+    }
+
+    /**
+     * used to push limit down to localAgg
+     */
+    public static class TopnPushInfo {
+        public List<OrderKey> orderkeys;
+        public long limit;
+
+        public TopnPushInfo(List<OrderKey> orderkeys, long limit) {
+            this.orderkeys = ImmutableList.copyOf(orderkeys);
+            this.limit = limit;
+        }
+    }
+
+    public TopnPushInfo getTopnPushInfo() {
+        Optional<Object> obj = getMutableState(MutableState.KEY_PUSH_TOPN_TO_AGG);
+        if (obj.isPresent() && obj.get() instanceof TopnPushInfo) {
+            return (TopnPushInfo) obj.get();
+        }
+        return null;
+    }
+
+    public PhysicalHashAggregate<CHILD_TYPE> setTopnPushInfo(TopnPushInfo topnPushInfo) {
+        setMutableState(MutableState.KEY_PUSH_TOPN_TO_AGG, topnPushInfo);
+        return this;
     }
 }
